@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -106,7 +107,8 @@ class ShellExecutor:
         try:
             # Usa shell appropriata per il OS
             if shell == "powershell":
-                executable = "powershell"
+                # Su Windows: 'powershell' per PS5, 'pwsh' per PS7
+                executable = "pwsh" if shutil.which("pwsh") else "powershell"
             elif shell == "zsh":
                 executable = "/bin/zsh"
             elif shell == "bash":
