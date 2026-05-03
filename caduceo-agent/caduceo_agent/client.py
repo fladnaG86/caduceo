@@ -40,6 +40,36 @@ from caduceo_common.utils import detect_os, generate_agent_id
 
 logger = logging.getLogger("caduceo.agent")
 
+# ── Allowed paths for file operations ──────────────────────────────────────
+
+# Directory consentite per operazioni file (path traversal protection)
+# Se vuoto, tutte le path sono consentite (legacy mode)
+ALLOWED_PATHS = os.environ.get("CADUCEO_ALLOWED_PATHS", "").split(":") if os.environ.get("CADUCEO_ALLOWED_PATHS") else []
+
+
+def validate_path(path_str: str) -> Path:
+    """
+    Valida un path per operazioni file. Resolve symlinks e verifica che
+    il path finale sia dentro una directory consentita (se configurata).
+    """
+    file_path = Path(path_str).expanduser().resolve()
+
+    # Se ALLOWED_PATHS e' vuoto, consenti tutto (legacy)
+    if not ALLOWED_PATHS:
+        return file_path
+
+    # Verifica che il path sia dentro una delle directory consentite
+    for allowed in ALLOWED_PATHS:
+        allowed_path = Path(allowed).resolve()
+        try:
+            file_path.relative_to(allowed_path)
+            return file_path
+        except ValueError:
+            continue
+
+    raise PermissionError(f"Path non consentita: {path_str}. Directory ammesse: {ALLOWED_PATHS}")
+
+
 # ── Shell Executor ──────────────────────────────────────────────────────────
 
 class ShellExecutor:
@@ -63,19 +93,32 @@ class ShellExecutor:
         """Esegue un comando shell e restituisce stdout, stderr, exit_code."""
         shell = shell or ShellExecutor.detect_shell()
 
+        # Costruisci il comando completo in modo sicuro
+        # Usa shlex.quote per escapare gli argomenti se forniti separatamente
         if args:
-            full_cmd = f"{command} {' '.join(args)}"
+            import shlex
+            full_cmd = f"{command} {' '.join(shlex.quote(a) for a in args)}"
         else:
             full_cmd = command
 
         start_time = time.time()
 
         try:
+            # Usa shell appropriata per il OS
+            if shell == "powershell":
+                executable = "powershell"
+            elif shell == "zsh":
+                executable = "/bin/zsh"
+            elif shell == "bash":
+                executable = "/bin/bash"
+            else:
+                executable = None  # Default shell
+
             proc = await asyncio.create_subprocess_shell(
                 full_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                shell=True,
+                executable=executable,
             )
 
             stdout, stderr = await asyncio.wait_for(
@@ -109,15 +152,21 @@ class ShellExecutor:
 # ── File Transfer ───────────────────────────────────────────────────────────
 
 class FileManager:
-    """Gestione trasferimento file."""
+    """Gestione trasferimento file con path traversal protection."""
 
     @staticmethod
     async def download(path: str) -> dict:
         """Legge un file e lo restituisce come base64."""
-        file_path = Path(path).expanduser()
+        try:
+            file_path = validate_path(path)
+        except PermissionError as e:
+            return {"error": str(e), "size": 0, "content_b64": ""}
 
         if not file_path.exists():
             return {"error": f"File non trovato: {path}", "size": 0, "content_b64": ""}
+
+        if not file_path.is_file():
+            return {"error": f"Non e' un file: {path}", "size": 0, "content_b64": ""}
 
         if file_path.stat().st_size > 50 * 1024 * 1024:
             return {"error": f"File troppo grande (max 50MB): {path}", "size": 0, "content_b64": ""}
@@ -134,11 +183,14 @@ class FileManager:
 
     @staticmethod
     async def upload(path: str, content_b64: str, overwrite: bool = False) -> dict:
-        """Scrive un file ricevuto come base64."""
-        file_path = Path(path).expanduser()
+        """Scrive un file ricevuto come base64, con path traversal protection."""
+        try:
+            file_path = validate_path(path)
+        except PermissionError as e:
+            return {"error": str(e), "success": False}
 
         if file_path.exists() and not overwrite:
-            return {"error": f"File esiste già: {path}", "success": False}
+            return {"error": f"File esiste gia': {path}", "success": False}
 
         # Crea directory genitore se necessario
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,6 +361,12 @@ class CaduceoAgent:
         self.screenshots = ScreenshotCapture()
         self.sysinfo = SystemInfo()
 
+    def _generate_psk_challenge(self) -> str:
+        """Genera la challenge PSK per l'autenticazione del WebSocket."""
+        return hashlib.sha256(
+            (self.psk_hex + self.agent_id).encode()
+        ).hexdigest()
+
     async def connect(self):
         """Connetti al relay con backoff esponenziale."""
         while self.running:
@@ -323,15 +381,18 @@ class CaduceoAgent:
                 ) as ws:
                     self.ws = ws
 
-                    # Registra
+                    # Registra con autenticazione PSK
                     register_msg = RegisterMessage(agent_id=self.agent_id, tags=self.tags)
-                    # Popola i campi automaticamente
                     if not register_msg.hostname:
                         register_msg.hostname = platform.node()
                     if not register_msg.arch:
                         register_msg.arch = platform.machine()
 
-                    await ws.send(json.dumps(register_msg.to_dict()))
+                    reg_dict = register_msg.to_dict()
+                    # Aggiungi challenge PSK per autenticazione
+                    reg_dict["psk_challenge"] = self._generate_psk_challenge()
+
+                    await ws.send(json.dumps(reg_dict))
 
                     # Attendi conferma
                     raw_response = await ws.recv()
@@ -373,27 +434,39 @@ class CaduceoAgent:
         try:
             async for raw_msg in ws:
                 try:
-                    msg = json.loads(raw_msg)
+                    msg_data = json.loads(raw_msg)
                 except json.JSONDecodeError:
                     logger.warning(f"Messaggio JSON non valido: {raw_msg[:100]}")
                     continue
 
-                msg_type = msg.get("type", "")
+                # Decritta se il messaggio e' crittografato
+                if "nonce_b64" in msg_data and "ciphertext_b64" in msg_data:
+                    try:
+                        plaintext = self.crypto.decrypt(
+                            msg_data["nonce_b64"],
+                            msg_data["ciphertext_b64"],
+                        )
+                        msg_data = json.loads(plaintext)
+                    except Exception as e:
+                        logger.error(f"Decryption fallita: {e}")
+                        continue
+
+                msg_type = msg_data.get("type", "")
 
                 if msg_type == MessageType.COMMAND:
-                    await self._handle_command(msg, ws)
+                    await self._handle_command(msg_data, ws)
                 elif msg_type == MessageType.FILE_DOWNLOAD:
-                    await self._handle_file_download(msg, ws)
+                    await self._handle_file_download(msg_data, ws)
                 elif msg_type == MessageType.FILE_UPLOAD:
-                    await self._handle_file_upload(msg, ws)
+                    await self._handle_file_upload(msg_data, ws)
                 elif msg_type == MessageType.SCREENSHOT:
-                    await self._handle_screenshot(msg, ws)
+                    await self._handle_screenshot(msg_data, ws)
                 elif msg_type == MessageType.INFO:
-                    await self._handle_info(msg, ws)
+                    await self._handle_info(msg_data, ws)
                 elif msg_type == MessageType.PING:
                     await ws.send(json.dumps({"type": "pong", "timestamp": int(time.time())}))
                 elif msg_type == "register_ack":
-                    # Già gestito nella connect()
+                    # Gia' gestito nella connect()
                     logger.debug(f"Ricevuto register_ack tardivo")
                 else:
                     logger.debug(f"Messaggio non gestito: {msg_type}")
@@ -431,6 +504,16 @@ class CaduceoAgent:
                 logger.error(f"Errore heartbeat: {e}")
                 break
 
+    # ── Helpers per invio messaggi crittografati ─────────────────────────
+
+    async def _send_response(self, ws, response: dict):
+        """Invia una risposta al relay, crittografandola se il crypto e' disponibile."""
+        if self.crypto:
+            encrypted = self.crypto.encrypt_message(response)
+            await ws.send(json.dumps(encrypted))
+        else:
+            await ws.send(json.dumps(response))
+
     # ── Command Handlers ────────────────────────────────────────────────
 
     async def _handle_command(self, msg: dict, ws):
@@ -441,7 +524,7 @@ class CaduceoAgent:
         timeout = msg.get("timeout", COMMAND_TIMEOUT_DEFAULT)
         shell = msg.get("shell", "")
 
-        logger.info(f"Esecuzione comando: {command} {' '.join(args)}")
+        logger.info(f"Esecuzione comando: {command} {' '.join(args) if args else ''}")
 
         result = await self.shell.execute(command, args, timeout, shell)
 
@@ -454,7 +537,7 @@ class CaduceoAgent:
             "stderr": result["stderr"],
             "duration_ms": result["duration_ms"],
         }
-        await ws.send(json.dumps(response))
+        await self._send_response(ws, response)
 
     async def _handle_file_download(self, msg: dict, ws):
         """Scarica un file dal PC e lo invia al relay."""
@@ -470,12 +553,13 @@ class CaduceoAgent:
             "agent_id": self.agent_id,
             **result,
         }
-        await ws.send(json.dumps(response))
+        await self._send_response(ws, response)
 
     async def _handle_file_upload(self, msg: dict, ws):
         """Riceve un file dal relay e lo salva sul PC."""
         request_id = msg.get("request_id", "")
         path = msg.get("path", "")
+        # Se il messaggio e' crittografato, il content_b64 e' gia' nel messaggio decrittato
         content_b64 = msg.get("content_b64", "")
         overwrite = msg.get("overwrite", False)
 
@@ -488,7 +572,7 @@ class CaduceoAgent:
             "agent_id": self.agent_id,
             **result,
         }
-        await ws.send(json.dumps(response))
+        await self._send_response(ws, response)
 
     async def _handle_screenshot(self, msg: dict, ws):
         """Cattura uno screenshot e lo invia al relay."""
@@ -503,7 +587,7 @@ class CaduceoAgent:
             "agent_id": self.agent_id,
             **result,
         }
-        await ws.send(json.dumps(response))
+        await self._send_response(ws, response)
 
     async def _handle_info(self, msg: dict, ws):
         """Raccoglie info di sistema e le invia al relay."""
@@ -518,7 +602,7 @@ class CaduceoAgent:
             "agent_id": self.agent_id,
             **info,
         }
-        await ws.send(json.dumps(response))
+        await self._send_response(ws, response)
 
     async def start(self):
         """Avvia l'agent."""
@@ -533,6 +617,34 @@ class CaduceoAgent:
             await self.ws.close()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+
+
+# ── PSK Loading Helper ──────────────────────────────────────────────────────
+
+def load_psk(psk_arg: str | None = None) -> str:
+    """
+    Carica la PSK da (in ordine di priorita'):
+    1. Argomento CLI --psk (legacy, sconsigliato)
+    2. Variabile d'ambiente CADUCEO_PSK
+    3. File ~/.caduceo/agent.psk
+    """
+    if psk_arg:
+        return psk_arg
+
+    # Variabile d'ambiente
+    env_psk = os.environ.get("CADUCEO_PSK")
+    if env_psk:
+        return env_psk
+
+    # File su disco
+    psk_file = Path.home() / ".caduceo" / "agent.psk"
+    if psk_file.exists():
+        psk = psk_file.read_text().strip()
+        if psk:
+            return psk
+
+    logger.warning("Nessuna PSK trovata. Usare --psk, CADUCEO_PSK env, o ~/.caduceo/agent.psk")
+    return ""
 
 
 # ── Service Installation ────────────────────────────────────────────────────
@@ -561,6 +673,19 @@ class ServiceInstaller:
         agent_id = agent_id or generate_agent_id()
         tags_str = ",".join(tags or ["caduceo"])
 
+        # Salva la PSK in un file con permessi restrittivi, non nel service file
+        psk_file = Path.home() / ".caduceo" / "agent.psk"
+        psk_file.parent.mkdir(parents=True, exist_ok=True)
+        psk_file.write_text(psk_hex)
+        psk_file.chmod(0o600)
+
+        # Crea environment file
+        env_file = Path("/etc/caduceo/agent.env")
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_content = f"CADUCEO_PSK={psk_hex}\n"
+        env_file.write_text(env_content)
+        env_file.chmod(0o600)
+
         service_content = f"""[Unit]
 Description=Caduceo Agent - Remote AI Access
 After=network-online.target
@@ -568,10 +693,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={python_path} -m caduceo_agent --relay {relay_url} --psk {psk_hex} --agent-id {agent_id} --tags {tags_str}
+ExecStart={python_path} -m caduceo_agent --relay {relay_url} --agent-id {agent_id} --tags {tags_str}
 Restart=on-failure
 RestartSec=10
+EnvironmentFile=/etc/caduceo/agent.env
 Environment=HOME={Path.home()}
+
+# Sicurezza: limita capabilities
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
 
 [Install]
 WantedBy=default.target
@@ -584,6 +716,9 @@ WantedBy=default.target
         os.system("systemctl start caduceo-agent")
 
         logger.info(f"Servizio systemd installato: {service_path}")
+        logger.info("PSK salvata in (non nel service file):")
+        logger.info(f"  File: {psk_file} (permessi 0600)")
+        logger.info(f"  Env:  {env_file} (permessi 0600)")
         logger.info("Abilitato con: systemctl enable caduceo-agent")
         logger.info("Avviato con: systemctl start caduceo-agent")
 
@@ -593,6 +728,12 @@ WantedBy=default.target
         python_path = sys.executable
         agent_id = agent_id or generate_agent_id()
         tags_str = ",".join(tags or ["caduceo"])
+
+        # Salva PSK in file separato
+        psk_file = Path.home() / ".caduceo" / "agent.psk"
+        psk_file.parent.mkdir(parents=True, exist_ok=True)
+        psk_file.write_text(psk_hex)
+        psk_file.chmod(0o600)
 
         plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -607,13 +748,16 @@ WantedBy=default.target
         <string>caduceo_agent</string>
         <string>--relay</string>
         <string>{relay_url}</string>
-        <string>--psk</string>
-        <string>{psk_hex}</string>
         <string>--agent-id</string>
         <string>{agent_id}</string>
         <string>--tags</string>
         <string>{tags_str}</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CADUCEO_PSK</key>
+        <string>{psk_hex}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -632,7 +776,7 @@ WantedBy=default.target
         os.system(f"launchctl load {plist_path}")
 
         logger.info(f"Servizio launchd installato: {plist_path}")
-        logger.info("Avviato con: launchctl load ~/Library/LaunchAgents/com.caduceo.agent.plist")
+        logger.info("PSK salvata in EnvironmentVariables (non in CommandLine)")
 
     @staticmethod
     def _install_windows(relay_url: str, psk_hex: str, agent_id: str, tags: list[str] | None):
@@ -644,6 +788,8 @@ WantedBy=default.target
             import servicemanager
         except ImportError:
             logger.error("pywin32 richiesto per servizio Windows. Installa con: pip install pywin32")
+            logger.info("Alternativa: configura come task pianificato in Task Scheduler")
+            logger.info("  Con variabile d'ambiente CADUCEO_PSK impostata nel sistema")
             return
 
         logger.info("Servizio Windows: usa 'python -m caduceo_agent --install-service' per installare")
@@ -657,7 +803,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Caduceo Agent - Remote AI Access")
     parser.add_argument("--relay", required=True, help="URL del relay (es. wss://maulanhermes.uk:8443)")
-    parser.add_argument("--psk", required=True, help="Pre-shared key hex")
+    parser.add_argument("--psk", default=None, help="Pre-shared key hex (sconsigliato: usa CADUCEO_PSK env o ~/.caduceo/agent.psk)")
     parser.add_argument("--agent-id", default="", help="Agent ID (auto-generato se vuoto)")
     parser.add_argument("--tags", default="caduceo", help="Tag separati da virgola")
     parser.add_argument("--token", default="", help="JWT token per autenticazione")
@@ -674,13 +820,19 @@ def main():
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
     agent_id = args.agent_id or generate_agent_id()
 
+    # Carica PSK da fonte sicura (non visibile in ps)
+    psk_hex = load_psk(args.psk)
+    if not psk_hex:
+        logger.error("PSK mancante. Passa --psk, imposta CADUCEO_PSK, o crea ~/.caduceo/agent.psk")
+        sys.exit(1)
+
     if args.install:
-        ServiceInstaller.install(args.relay, args.psk, agent_id, tags)
+        ServiceInstaller.install(args.relay, psk_hex, agent_id, tags)
         return
 
     agent = CaduceoAgent(
         relay_url=args.relay,
-        psk_hex=args.psk,
+        psk_hex=psk_hex,
         agent_id=agent_id,
         tags=tags,
         token=args.token,

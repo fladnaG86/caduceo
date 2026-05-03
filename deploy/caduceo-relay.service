@@ -1,0 +1,34 @@
+[Unit]
+Description=Caduceo Relay Server - Remote AI Access
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=manutenzione
+Group=manutenzione
+WorkingDirectory=/home/manutenzione/caduceo
+ExecStart=/home/manutenzione/caduceo/venv/bin/python -m caduceo_relay
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Sicurezza
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/manutenzione/.caduceo /tmp
+PrivateTmp=true
+
+# Environment - PSK e JWT.secret dal file config
+# Non passare secrets come argomenti CLI!
+Environment=CADUCEO_RELAY_CONFIG=/home/manutenzione/.caduceo/relay.json
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=caduceo-relay
+
+[Install]
+WantedBy=multi-user.target

@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+import os
+import stat
 import time
 from pathlib import Path
 
 import jwt
 import aiosqlite
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -32,19 +34,23 @@ class RelayConfig:
     def __init__(self):
         self.host = "0.0.0.0"
         self.port = 8443
-        self.jwt_secret = "change-me-in-production"
+        self.jwt_secret = ""
         self.psk_hex = ""
         self.queue_ttl = QUEUE_TTL_DEFAULT
         self.db_path = Path.home() / ".caduceo" / "relay.db"
         self.config_path = Path.home() / ".caduceo" / "relay.json"
+        self.allowed_origins: list[str] = []
 
-        # Se non c'e' PSK, genera e salva
+        # Genera PSK e JWT secret se non presenti
         if not self.psk_hex:
             self.psk_hex = Crypto().generate_key_hex()
+        if not self.jwt_secret:
+            import secrets
+            self.jwt_secret = secrets.token_hex(32)
         self.crypto = Crypto.from_hex(self.psk_hex)
 
     def save(self):
-        """Salva la configurazione su file JSON."""
+        """Salva la configurazione su file JSON con permessi restrittivi."""
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "host": self.host,
@@ -54,6 +60,8 @@ class RelayConfig:
             "queue_ttl": self.queue_ttl,
         }
         self.config_path.write_text(json.dumps(data, indent=2))
+        # Permessi restrittivi: solo il proprietario puo' leggere
+        os.chmod(self.config_path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
         logger.info(f"Config salvata in {self.config_path}")
 
     @classmethod
@@ -78,6 +86,20 @@ class RelayConfig:
             config.save()
             logger.info(f"Nuova config creata e salvata in {path}")
         return config
+
+    def save_credentials(self):
+        """Salva credentials separati per Hermes (con permessi restrittivi)."""
+        creds_path = Path.home() / ".caduceo" / "credentials.json"
+        creds_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "relay_url": f"http://127.0.0.1:{self.port}",
+            "relay_ws_url": f"ws://127.0.0.1:{self.port}",
+            "jwt_secret": self.jwt_secret,
+            "psk_hex": self.psk_hex,
+            "note": "JWT token can be generated from jwt_secret. For production use WSS and HTTPS on maulanhermes.uk",
+        }
+        creds_path.write_text(json.dumps(data, indent=2))
+        os.chmod(creds_path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
 
 
 # ── Modelli API ─────────────────────────────────────────────────────────────
@@ -147,13 +169,14 @@ class AgentRegistry:
     def __init__(self):
         self.agents: dict[str, AgentInfo] = {}
         self.pending_responses: dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
 
-    def register(self, agent: AgentInfo):
+    async def register(self, agent: AgentInfo):
         # Se l'agent era gia' registrato, chiudi la vecchia connessione
         if agent.agent_id in self.agents:
             old = self.agents[agent.agent_id]
             try:
-                asyncio.get_event_loop().create_task(old.websocket.close())
+                await old.websocket.close()
             except Exception:
                 pass
         self.agents[agent.agent_id] = agent
@@ -210,12 +233,13 @@ class CommandQueue:
         expires_at = now + self.ttl
         command_json = json.dumps(command)
 
-        # Limita la coda per agent
-        cursor = await db.execute(
+        # Limita la coda per agent (con transazione)
+        async with db.execute(
             "SELECT COUNT(*) FROM command_queue WHERE agent_id = ?",
             (agent_id,)
-        )
-        count = (await cursor.fetchone())[0]
+        ) as cursor:
+            row = await cursor.fetchone()
+            count = row[0] if row else 0
         if count >= QUEUE_MAX_SIZE:
             logger.warning(f"Coda piena per {agent_id} ({count} comandi)")
             return
@@ -280,16 +304,20 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         version=PROTOCOL_VERSION,
     )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # CORS restrittivo: solo origins configurate, o disabilitato se vuoto
+    allowed_origins = config.allowed_origins if config.allowed_origins else []
+    if allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=allowed_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
 
     registry = AgentRegistry()
     queue = CommandQueue(config.db_path, config.queue_ttl)
+    crypto = config.crypto
 
     # Inizializza DB all'avvio
     @app.on_event("startup")
@@ -320,19 +348,47 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
     @app.websocket(WS_AGENT_PATH)
     async def agent_endpoint(ws: WebSocket):
-        """Endpoint WebSocket per agent remoti."""
+        """Endpoint WebSocket per agent remoti. Richiede autenticazione PSK."""
         await ws.accept()
         agent_info = None
 
         try:
-            # Attendi registrazione
-            raw = await ws.receive_text()
-            msg = parse_message(json.loads(raw))
+            # Fase 1: attesa auth con timeout di 10 secondi
+            try:
+                raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
+            except asyncio.TimeoutError:
+                await ws.close(code=4003, reason="Auth timeout")
+                logger.warning("Agent disconnesso: auth timeout")
+                return
 
-            if msg.type != MessageType.REGISTER:
+            try:
+                msg_data = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.close(code=4002, reason="JSON non valido")
+                return
+
+            # Verifica autenticazione PSK: il primo messaggio deve essere register con psk_challenge
+            msg_type = msg_data.get("type", "")
+            psk_challenge = msg_data.get("psk_challenge", "")
+
+            if msg_type != MessageType.REGISTER:
                 await ws.close(code=4001, reason="Registrazione richiesta")
                 return
 
+            # Verifica PSK: l'agent deve dimostrare di conoscere la chiave
+            # Invia un nonce e verifica che l'agent lo crittografi correttamente
+            # Metodo semplificato: l'agent invia il PSK hash come challenge
+            import hashlib
+            expected_challenge = hashlib.sha256(
+                (config.psk_hex + msg_data.get("agent_id", "")).encode()
+            ).hexdigest()
+
+            if psk_challenge != expected_challenge:
+                await ws.close(code=4003, reason="Autenticazione PSK fallita")
+                logger.warning(f"Tentativo di connessione non autorizzato da agent_id={msg_data.get('agent_id', '?')}")
+                return
+
+            msg = parse_message(msg_data)
             agent_info = AgentInfo(agent_id=msg.agent_id, websocket=ws)
             agent_info.hostname = msg.hostname
             agent_info.os = msg.os
@@ -341,7 +397,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             agent_info.python_version = msg.python_version
             agent_info.tags = getattr(msg, "tags", [])
 
-            registry.register(agent_info)
+            await registry.register(agent_info)
 
             # Invia conferma registrazione
             await ws.send_json({"type": "register_ack", "agent_id": msg.agent_id, "status": "ok"})
@@ -354,7 +410,21 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             # Loop principale
             while True:
                 raw = await ws.receive_text()
-                msg = parse_message(json.loads(raw))
+                # Decritta il messaggio se crittografato
+                msg_data = json.loads(raw)
+                # Se il messaggio ha nonce_b64 + ciphertext_b64, decritta
+                if "nonce_b64" in msg_data and "ciphertext_b64" in msg_data:
+                    try:
+                        plaintext = crypto.decrypt(
+                            msg_data["nonce_b64"],
+                            msg_data["ciphertext_b64"],
+                        )
+                        msg_data = json.loads(plaintext)
+                    except Exception as e:
+                        logger.error(f"Decryption fallita: {e}")
+                        continue
+
+                msg = parse_message(msg_data)
 
                 if msg.type == MessageType.HEARTBEAT:
                     agent_info.last_heartbeat = time.time()
@@ -423,15 +493,19 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             "shell": cmd.shell,
         }
 
-        future = asyncio.get_event_loop().create_future()
-        registry.pending_responses[request_id] = future
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
 
         try:
-            await agent.websocket.send_json(message)
+            # Crittografa il messaggio prima di inviarlo
+            encrypted = crypto.encrypt_message(message)
+            await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=cmd.timeout)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
-            del registry.pending_responses[request_id]
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
             raise HTTPException(504, f"Timeout comando su {agent_id}")
 
     @app.post("/api/agents/{agent_id}/file/download")
@@ -444,19 +518,23 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(503, f"Agent {agent_id} offline")
 
         request_id = f"req-{time.time_ns()}"
-        future = asyncio.get_event_loop().create_future()
-        registry.pending_responses[request_id] = future
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
 
         try:
-            await agent.websocket.send_json({
+            message = {
                 "type": MessageType.FILE_DOWNLOAD,
                 "request_id": request_id,
                 "path": req.path,
-            })
+            }
+            encrypted = crypto.encrypt_message(message)
+            await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=60)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
-            del registry.pending_responses[request_id]
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
             raise HTTPException(504, f"Timeout download file da {agent_id}")
 
     @app.post("/api/agents/{agent_id}/file/upload")
@@ -469,21 +547,25 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(503, f"Agent {agent_id} offline")
 
         request_id = f"req-{time.time_ns()}"
-        future = asyncio.get_event_loop().create_future()
-        registry.pending_responses[request_id] = future
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
 
         try:
-            await agent.websocket.send_json({
+            message = {
                 "type": MessageType.FILE_UPLOAD,
                 "request_id": request_id,
                 "path": req.path,
                 "content_b64": req.content_b64,
                 "overwrite": req.overwrite,
-            })
+            }
+            encrypted = crypto.encrypt_message(message)
+            await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=60)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
-            del registry.pending_responses[request_id]
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
             raise HTTPException(504, f"Timeout upload file su {agent_id}")
 
     @app.post("/api/agents/{agent_id}/screenshot")
@@ -496,18 +578,22 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(503, f"Agent {agent_id} offline")
 
         request_id = f"req-{time.time_ns()}"
-        future = asyncio.get_event_loop().create_future()
-        registry.pending_responses[request_id] = future
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
 
         try:
-            await agent.websocket.send_json({
+            message = {
                 "type": MessageType.SCREENSHOT,
                 "request_id": request_id,
-            })
+            }
+            encrypted = crypto.encrypt_message(message)
+            await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=30)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
-            del registry.pending_responses[request_id]
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
             raise HTTPException(504, f"Timeout screenshot su {agent_id}")
 
     @app.get("/api/agents/{agent_id}/info")
@@ -520,18 +606,22 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             return agent.to_dict()
 
         request_id = f"req-{time.time_ns()}"
-        future = asyncio.get_event_loop().create_future()
-        registry.pending_responses[request_id] = future
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
 
         try:
-            await agent.websocket.send_json({
+            message = {
                 "type": MessageType.INFO,
                 "request_id": request_id,
-            })
+            }
+            encrypted = crypto.encrypt_message(message)
+            await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=15)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
-            del registry.pending_responses[request_id]
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
             return agent.to_dict()
 
     @app.get("/api/health")
@@ -544,21 +634,26 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             "agents_total": len(registry.agents),
         }
 
-    # ── Token: bootstrap e generazione ──────────────────────────────────
+    # ── Token: sola generazione da localhost ────────────────────────────
 
     @app.post("/api/token")
-    async def create_token(req: TokenRequest = TokenRequest()):
+    async def create_token(req: TokenRequest = TokenRequest(), request: Request = None):
         """
         Genera un nuovo JWT token.
-        Il primo token va generato con il jwt_secret dal config file.
-        Per sicurezza, questa rotta e' accessibile solo da localhost o con un token valido.
+        Accessibile SOLO da localhost per bootstrap.
+        In produzione, usare il CLI tool o la credentials file.
         """
-        # Permetti senza auth solo da localhost (per bootstrap)
-        import hashlib
-        # Se la richiesta non ha auth, genera un token di bootstrap
-        # In produzione, questo va protetto con network policy
+        # Verifica che la richiesta arrivi da localhost
+        if request:
+            client_host = request.client.host if request.client else "unknown"
+            if client_host not in ("127.0.0.1", "::1", "localhost"):
+                raise HTTPException(403, "Token generation consentita solo da localhost. Usa il CLI tool per generare token remoti.")
+
+        if not config.jwt_secret:
+            raise HTTPException(500, "JWT secret non configurato")
+
         token = jwt.encode(
-            {"sub": req.subject, "role": req.role, "exp": time.time() + 86400 * 30},
+            {"sub": req.subject, "role": req.role, "exp": int(time.time()) + 86400 * 30},
             config.jwt_secret,
             algorithm="HS256"
         )
@@ -599,20 +694,22 @@ def main():
     if not config_path.exists():
         config.config_path = config_path
         config.save()
+        config.save_credentials()
+
+    # Non stampare la PSK intera! Solo ultimi 8 caratteri per verifica
+    psk_tail = config.psk_hex[-8:] if len(config.psk_hex) > 8 else "****"
+    jwt_tail = config.jwt_secret[-8:] if len(config.jwt_secret) > 8 else "****"
 
     logger.info(f"Avvio Caduceo Relay su {config.host}:{config.port}")
-    logger.info(f"PSK: {config.psk_hex[:8]}...")
     logger.info(f"Config: {config_path}")
-    logger.info(f"Agent endpoint: ws://{config.host}:{config.port}{WS_AGENT_PATH}")
 
-    # Mostra il PSK per la configurazione degli agent
     print(f"\n{'='*60}")
     print(f"  Caduceo Relay Server v{PROTOCOL_VERSION}")
     print(f"{'='*60}")
     print(f"  Host:       {config.host}:{config.port}")
     print(f"  Config:     {config_path}")
-    print(f"  PSK:        {config.psk_hex}")
-    print(f"  JWT Secret:  {config.jwt_secret[:16]}...")
+    print(f"  PSK:        ...{psk_tail}")
+    print(f"  JWT Secret: ...{jwt_tail}")
     print(f"  Agent WS:   ws://{config.host}:{config.port}{WS_AGENT_PATH}")
     print(f"  REST API:   http://{config.host}:{config.port}/api")
     print(f"{'='*60}\n")
