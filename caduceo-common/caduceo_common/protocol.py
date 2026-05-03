@@ -1,0 +1,22 @@
+"""Caduceo Common - Protocollo e utilità condivise."""
+
+from .constants import (
+    PROTOCOL_VERSION,
+    DEFAULT_RELAY_PORT,
+    DEFAULT_RELAY_HOST,
+    WS_AGENT_PATH,
+    HEARTBEAT_INTERVAL,
+    HEARTBEAT_TIMEOUT,
+    RECONNECT_INITIAL,
+    RECONNECT_MAX,
+    RECONNECT_MULTIPLIER,
+    COMMAND_TIMEOUT_DEFAULT,
+    CRYPTO_ALGORITHM,
+    CRYPTO_KEY_LENGTH,
+    MessageType,
+    OS_WINDOWS,
+    OS_LINUX,
+    OS_MACOS,
+)
+
+__version__ = PROTOCOL_VERSION

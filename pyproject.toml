@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caduceo"
+version = "0.1.0"
+description = "Il bastone di Hermes che raggiunge ogni mondo - Remote AI agent access"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Hermes Agent", email = "ermes_agent_maulan@zohomail.eu" }
+]
+keywords = ["remote-access", "ai-agent", "shell", "relay", "hermes"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
+
+dependencies = [
+    "websockets>=12.0",
+    "cryptography>=42.0",
+    "pyjwt>=2.8",
+    "psutil>=5.9",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+relay = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.19",
+]
+agent = [
+    "pillow>=10.0",
+    "pyautogui>=0.9",
+]
+windows = [
+    "pywin32>=306",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+    "mypy>=1.8",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
