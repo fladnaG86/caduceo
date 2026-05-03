@@ -1,9 +1,9 @@
-# Caduceo Relay - Caddy reverse proxy (sviluppo locale)
+# Caduceo Relay - Caddy reverse proxy
 #
 # In produzione il traffico passa tramite Cloudflare Tunnel:
 #   client → Cloudflare → cloudflared → localhost:8443
 #
-# Questo Caddyfile serve solo per test locali sulla porta 8400.
+# Questo Caddyfile serve solo per sviluppo locale sulla porta 8400.
 
 :8400 {
 	reverse_proxy localhost:8443
