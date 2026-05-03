@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare Tunnel - Caduceo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel run --token eyJhIjoiZDc1ZWM5MzQzNmZkM2I3MjcyMjhmZGI4MmRhMGM4MWYiLCJ0IjoiNjA1NmU0MzMtYmZkYy00NDU3LTkyNmMtZjZmYjZmNzgxMWU1IiwicyI6IlpUTTFaV1pqTmpVdE5HWTJNeTAwTTJZNUxXRXlORGd0TlRRNU9EQmhNMkpqTVRBeCJ9
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
