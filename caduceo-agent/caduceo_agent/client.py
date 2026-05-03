@@ -71,22 +71,12 @@ class ShellExecutor:
         start_time = time.time()
 
         try:
-            if shell == "powershell":
-                # Windows PowerShell
-                proc = await asyncio.create_subprocess_shell(
-                    full_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    shell=True,
-                )
-            else:
-                # bash / zsh / sh
-                proc = await asyncio.create_subprocess_shell(
-                    full_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    shell=True,
-                )
+            proc = await asyncio.create_subprocess_shell(
+                full_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                shell=True,
+            )
 
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
@@ -266,8 +256,6 @@ class SystemInfo:
     @staticmethod
     def collect() -> dict:
         """Raccoglie informazioni complete sul sistema."""
-        import platform
-
         boot_time = psutil.boot_time()
         uptime = int(time.time() - boot_time)
 
@@ -280,6 +268,7 @@ class SystemInfo:
                     key = "ipv4" if addr.family.name == "AF_INET" else "ipv6"
                     iface[key].append(addr.address)
 
+        disk_path = "C:\\" if detect_os() == "windows" else "/"
         return {
             "hostname": platform.node(),
             "os": detect_os(),
@@ -288,8 +277,8 @@ class SystemInfo:
             "cpu_count": psutil.cpu_count(),
             "memory_total": psutil.virtual_memory().total,
             "memory_percent": psutil.virtual_memory().percent,
-            "disk_total": psutil.disk_usage("/").total if detect_os() != "windows" else psutil.disk_usage("C:\\").total,
-            "disk_percent": psutil.disk_usage("/").percent if detect_os() != "windows" else psutil.disk_usage("C:\\").percent,
+            "disk_total": psutil.disk_usage(disk_path).total,
+            "disk_percent": psutil.disk_usage(disk_path).percent,
             "uptime_seconds": uptime,
             "network": net_ifaces,
         }
@@ -312,6 +301,7 @@ class CaduceoAgent:
         self.ws = None
         self.running = False
         self.reconnect_delay = RECONNECT_INITIAL
+        self._heartbeat_task = None
 
         # Handlers
         self.shell = ShellExecutor()
@@ -324,26 +314,36 @@ class CaduceoAgent:
         while self.running:
             try:
                 logger.info(f"Connessione a {self.relay_url}...")
+                ws_url = f"{self.relay_url}{WS_AGENT_PATH}"
+
                 async with websockets.connect(
-                    f"{self.relay_url}{WS_AGENT_PATH}",
+                    ws_url,
                     ping_interval=HEARTBEAT_INTERVAL,
                     ping_timeout=10,
                 ) as ws:
                     self.ws = ws
 
                     # Registra
-                    register = RegisterMessage(agent_id=self.agent_id, tags=self.tags)
-                    await ws.send(json.dumps(register.to_dict()))
+                    register_msg = RegisterMessage(agent_id=self.agent_id, tags=self.tags)
+                    # Popola i campi automaticamente
+                    if not register_msg.hostname:
+                        register_msg.hostname = platform.node()
+                    if not register_msg.arch:
+                        register_msg.arch = platform.machine()
+
+                    await ws.send(json.dumps(register_msg.to_dict()))
 
                     # Attendi conferma
-                    response = json.loads(await ws.receive_text())
+                    raw_response = await ws.recv()
+                    response = json.loads(raw_response)
+
                     if response.get("status") != "ok":
                         logger.error(f"Registrazione fallita: {response}")
                         await asyncio.sleep(self.reconnect_delay)
                         self.reconnect_delay = min(self.reconnect_delay * RECONNECT_MULTIPLIER, RECONNECT_MAX)
                         continue
 
-                    logger.info(f"Registrato come {self.agent_id}")
+                    logger.info(f"Registrato come {self.agent_id} (ack: {response.get('type', 'unknown')})")
                     self.reconnect_delay = RECONNECT_INITIAL  # Reset
 
                     # Loop messaggi
@@ -368,11 +368,16 @@ class CaduceoAgent:
     async def _message_loop(self, ws):
         """Loop principale di ricezione messaggi dal relay."""
         # Avvia heartbeat in parallelo
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
 
         try:
             async for raw_msg in ws:
-                msg = json.loads(raw_msg)
+                try:
+                    msg = json.loads(raw_msg)
+                except json.JSONDecodeError:
+                    logger.warning(f"Messaggio JSON non valido: {raw_msg[:100]}")
+                    continue
+
                 msg_type = msg.get("type", "")
 
                 if msg_type == MessageType.COMMAND:
@@ -387,23 +392,30 @@ class CaduceoAgent:
                     await self._handle_info(msg, ws)
                 elif msg_type == MessageType.PING:
                     await ws.send(json.dumps({"type": "pong", "timestamp": int(time.time())}))
+                elif msg_type == "register_ack":
+                    # Già gestito nella connect()
+                    logger.debug(f"Ricevuto register_ack tardivo")
                 else:
                     logger.debug(f"Messaggio non gestito: {msg_type}")
 
         except websockets.ConnectionClosed:
             logger.warning("Connessione chiusa dal relay")
         finally:
-            heartbeat_task.cancel()
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _heartbeat_loop(self, ws):
-        """Invia heartbeat periodic al relay."""
+        """Invia heartbeat periodico al relay."""
         while True:
             try:
                 stats = {
                     "cpu_percent": psutil.cpu_percent(),
                     "memory_percent": psutil.virtual_memory().percent,
-                    "disk_percent": psutil.disk_usage("/").percent if detect_os() != "windows"
-                                    else psutil.disk_usage("C:\\").percent,
+                    "disk_percent": SystemInfo.collect().get("disk_percent", 0),
                 }
                 heartbeat = {
                     "type": MessageType.HEARTBEAT,
@@ -413,6 +425,8 @@ class CaduceoAgent:
                 }
                 await ws.send(json.dumps(heartbeat))
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
+            except websockets.ConnectionClosed:
+                break
             except Exception as e:
                 logger.error(f"Errore heartbeat: {e}")
                 break
@@ -517,6 +531,8 @@ class CaduceoAgent:
         self.running = False
         if self.ws:
             await self.ws.close()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
 
 
 # ── Service Installation ────────────────────────────────────────────────────
@@ -675,7 +691,6 @@ def main():
     except KeyboardInterrupt:
         logger.info("Arresto agente...")
         asyncio.run(agent.stop())
-
 
 if __name__ == "__main__":
     main()

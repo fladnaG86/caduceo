@@ -1,5 +1,6 @@
 """Caduceo Common - Modelli messaggi."""
 
+import platform
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -109,7 +110,7 @@ class FileResponse(Message):
 @dataclass
 class ScreenshotMessage(Message):
     """Richiesta screenshot dall'agent."""
-    type: MessageType.SCREENSHOT
+    type: str = MessageType.SCREENSHOT
 
 
 @dataclass

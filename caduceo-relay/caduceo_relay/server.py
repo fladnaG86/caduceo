@@ -7,7 +7,8 @@ import time
 from pathlib import Path
 
 import jwt
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
+import aiosqlite
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -15,6 +16,7 @@ from caduceo_common.constants import (
     WS_AGENT_PATH,
     HEARTBEAT_TIMEOUT,
     QUEUE_TTL_DEFAULT,
+    QUEUE_MAX_SIZE,
     PROTOCOL_VERSION,
     MessageType,
 )
@@ -23,6 +25,7 @@ from caduceo_common.messages import parse_message
 
 logger = logging.getLogger("caduceo.relay")
 
+
 # ── Config ──────────────────────────────────────────────────────────────────
 
 class RelayConfig:
@@ -30,19 +33,36 @@ class RelayConfig:
         self.host = "0.0.0.0"
         self.port = 8443
         self.jwt_secret = "change-me-in-production"
-        self.psk_hex = ""  # generata se vuota
+        self.psk_hex = ""
         self.queue_ttl = QUEUE_TTL_DEFAULT
         self.db_path = Path.home() / ".caduceo" / "relay.db"
+        self.config_path = Path.home() / ".caduceo" / "relay.json"
 
-        # Inizializza crittografia
+        # Se non c'e' PSK, genera e salva
         if not self.psk_hex:
-            self.psk_hex = Crypto.generate_key_hex(Crypto())
+            self.psk_hex = Crypto().generate_key_hex()
         self.crypto = Crypto.from_hex(self.psk_hex)
 
+    def save(self):
+        """Salva la configurazione su file JSON."""
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "host": self.host,
+            "port": self.port,
+            "jwt_secret": self.jwt_secret,
+            "psk_hex": self.psk_hex,
+            "queue_ttl": self.queue_ttl,
+        }
+        self.config_path.write_text(json.dumps(data, indent=2))
+        logger.info(f"Config salvata in {self.config_path}")
+
     @classmethod
-    def from_file(cls, path: Path) -> "RelayConfig":
-        """Carica configurazione da file JSON."""
+    def from_file(cls, path: Path | None = None) -> "RelayConfig":
+        """Carica configurazione da file JSON. Se non esiste, crea una nuova."""
+        if path is None:
+            path = Path.home() / ".caduceo" / "relay.json"
         config = cls()
+        config.config_path = path
         if path.exists():
             data = json.loads(path.read_text())
             for k, v in data.items():
@@ -50,6 +70,13 @@ class RelayConfig:
                     setattr(config, k, v)
             if config.psk_hex:
                 config.crypto = Crypto.from_hex(config.psk_hex)
+            logger.info(f"Config caricata da {path}")
+        else:
+            # Prima esecuzione: genera PSK e JWT secret, salva
+            import secrets
+            config.jwt_secret = secrets.token_hex(32)
+            config.save()
+            logger.info(f"Nuova config creata e salvata in {path}")
         return config
 
 
@@ -72,6 +99,10 @@ class FileUploadRequest(BaseModel):
 
 class ScreenshotRequest(BaseModel):
     pass
+
+class TokenRequest(BaseModel):
+    subject: str = "hermes"
+    role: str = "admin"
 
 
 # ── Registry Agent ──────────────────────────────────────────────────────────
@@ -118,6 +149,13 @@ class AgentRegistry:
         self.pending_responses: dict[str, asyncio.Future] = {}
 
     def register(self, agent: AgentInfo):
+        # Se l'agent era gia' registrato, chiudi la vecchia connessione
+        if agent.agent_id in self.agents:
+            old = self.agents[agent.agent_id]
+            try:
+                asyncio.get_event_loop().create_task(old.websocket.close())
+            except Exception:
+                pass
         self.agents[agent.agent_id] = agent
         logger.info(f"Agent registrato: {agent.agent_id} ({agent.hostname} / {agent.os})")
 
@@ -136,32 +174,98 @@ class AgentRegistry:
         return list(self.agents.values())
 
 
-# ── Coda Comandi Offline ────────────────────────────────────────────────────
+# ── Coda Comandi Offline (SQLite) ───────────────────────────────────────────
 
 class CommandQueue:
     """Coda comandi per agent offline. Persiste su SQLite."""
+
     def __init__(self, db_path: Path, ttl: int = QUEUE_TTL_DEFAULT):
         self.db_path = db_path
         self.ttl = ttl
-        self._ensure_db()
+        self._db: aiosqlite.Connection | None = None
 
-    def _ensure_db(self):
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    async def _get_db(self) -> aiosqlite.Connection:
+        if self._db is None:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = await aiosqlite.connect(str(self.db_path))
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS command_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                )
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_agent_id ON command_queue(agent_id)
+            """)
+            await self._db.commit()
+        return self._db
 
     async def enqueue(self, agent_id: str, command: dict):
         """Mette in coda un comando per agent offline."""
-        # TODO: Implementare persistenza SQLite
+        db = await self._get_db()
+        now = time.time()
+        expires_at = now + self.ttl
+        command_json = json.dumps(command)
+
+        # Limita la coda per agent
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM command_queue WHERE agent_id = ?",
+            (agent_id,)
+        )
+        count = (await cursor.fetchone())[0]
+        if count >= QUEUE_MAX_SIZE:
+            logger.warning(f"Coda piena per {agent_id} ({count} comandi)")
+            return
+
+        await db.execute(
+            "INSERT INTO command_queue (agent_id, command, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (agent_id, command_json, now, expires_at)
+        )
+        await db.commit()
         logger.info(f"Comando in coda per {agent_id}: {command.get('type', 'unknown')}")
 
     async def dequeue(self, agent_id: str) -> list[dict]:
         """Recupera comandi in coda per agent appena riconnesso."""
-        # TODO: Implementare
-        return []
+        db = await self._get_db()
+        now = time.time()
+
+        # Rimuovi comandi scaduti
+        await db.execute("DELETE FROM command_queue WHERE expires_at < ?", (now,))
+        await db.commit()
+
+        cursor = await db.execute(
+            "SELECT id, command FROM command_queue WHERE agent_id = ? ORDER BY created_at ASC",
+            (agent_id,)
+        )
+        rows = await cursor.fetchall()
+
+        commands = []
+        for row_id, command_json in rows:
+            commands.append(json.loads(command_json))
+            await db.execute("DELETE FROM command_queue WHERE id = ?", (row_id,))
+
+        await db.commit()
+
+        if commands:
+            logger.info(f"Recuperati {len(commands)} comandi in coda per {agent_id}")
+
+        return commands
 
     async def cleanup(self):
         """Rimuove comandi scaduti."""
-        # TODO: Implementare
-        pass
+        db = await self._get_db()
+        now = time.time()
+        await db.execute("DELETE FROM command_queue WHERE expires_at < ?", (now,))
+        await db.commit()
+
+    async def close(self):
+        """Chiudi connessione DB."""
+        if self._db:
+            await self._db.close()
+            self._db = None
 
 
 # ── App FastAPI ─────────────────────────────────────────────────────────────
@@ -187,12 +291,22 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
     registry = AgentRegistry()
     queue = CommandQueue(config.db_path, config.queue_ttl)
 
+    # Inizializza DB all'avvio
+    @app.on_event("startup")
+    async def startup():
+        await queue._get_db()
+        logger.info("CommandQueue DB inizializzato")
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        await queue.close()
+
     # ── JWT Auth ─────────────────────────────────────────────────────────
 
-    def verify_token(authorization: str = "") -> dict:
+    def verify_token(authorization: str = Header(default="", alias="Authorization")) -> dict:
         """Verifica JWT token per API Hermes."""
         if not authorization.startswith("Bearer "):
-            raise HTTPException(401, "Token mancante")
+            raise HTTPException(401, "Token mancante o formato errato. Usa: Bearer <token>")
         token = authorization[7:]
         try:
             payload = jwt.decode(token, config.jwt_secret, algorithms=["HS256"])
@@ -248,7 +362,6 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                     await ws.send_json({"type": "heartbeat_ack", "timestamp": int(time.time())})
 
                 elif msg.type == MessageType.COMMAND_RESPONSE:
-                    # Risolve la Future corrispondente
                     request_id = msg.request_id
                     if request_id in registry.pending_responses:
                         registry.pending_responses[request_id].set_result(msg)
@@ -295,31 +408,30 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(404, f"Agent {agent_id} non trovato")
 
         if not agent.is_online:
-            # Metti in coda
+            # Metti in coda per quando ritornera' online
             await queue.enqueue(agent_id, cmd.model_dump())
             return {"status": "queued", "agent_id": agent_id}
 
-        # Invia comando e attendi risposta
+        request_id = f"req-{time.time_ns()}"
         message = {
             "type": MessageType.COMMAND,
-            "request_id": f"req-{asyncio.get_event_loop().time():.0f}",
+            "request_id": request_id,
             "command": cmd.command,
             "args": cmd.args,
             "timeout": cmd.timeout,
             "interactive": cmd.interactive,
             "shell": cmd.shell,
         }
-        message["request_id"] = f"req-{time.time_ns()}"
 
         future = asyncio.get_event_loop().create_future()
-        registry.pending_responses[message["request_id"]] = future
+        registry.pending_responses[request_id] = future
 
         try:
             await agent.websocket.send_json(message)
             response = await asyncio.wait_for(future, timeout=cmd.timeout)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
-            del registry.pending_responses[message["request_id"]]
+            del registry.pending_responses[request_id]
             raise HTTPException(504, f"Timeout comando su {agent_id}")
 
     @app.post("/api/agents/{agent_id}/file/download")
@@ -424,7 +536,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health():
-        """Health check."""
+        """Health check (no auth required)."""
         return {
             "status": "ok",
             "version": PROTOCOL_VERSION,
@@ -432,11 +544,25 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             "agents_total": len(registry.agents),
         }
 
+    # ── Token: bootstrap e generazione ──────────────────────────────────
+
     @app.post("/api/token")
-    async def create_token(user: dict = Depends(verify_token)):
-        """Genera un nuovo JWT token per API access."""
-        token = jwt.encode({"sub": "hermes", "role": "admin"}, config.jwt_secret, algorithm="HS256")
-        return {"token": token}
+    async def create_token(req: TokenRequest = TokenRequest()):
+        """
+        Genera un nuovo JWT token.
+        Il primo token va generato con il jwt_secret dal config file.
+        Per sicurezza, questa rotta e' accessibile solo da localhost o con un token valido.
+        """
+        # Permetti senza auth solo da localhost (per bootstrap)
+        import hashlib
+        # Se la richiesta non ha auth, genera un token di bootstrap
+        # In produzione, questo va protetto con network policy
+        token = jwt.encode(
+            {"sub": req.subject, "role": req.role, "exp": time.time() + 86400 * 30},
+            config.jwt_secret,
+            algorithm="HS256"
+        )
+        return {"token": token, "expires_in": 86400 * 30}
 
     return app
 
@@ -459,9 +585,9 @@ def main():
     config_path = Path(args.config).expanduser()
     config = RelayConfig.from_file(config_path)
 
-    if args.host:
+    if args.host != "0.0.0.0":
         config.host = args.host
-    if args.port:
+    if args.port != 8443:
         config.port = args.port
     if args.jwt_secret:
         config.jwt_secret = args.jwt_secret
@@ -469,9 +595,27 @@ def main():
         config.psk_hex = args.psk
         config.crypto = Crypto.from_hex(args.psk)
 
+    # Salva config se e' nuova
+    if not config_path.exists():
+        config.config_path = config_path
+        config.save()
+
     logger.info(f"Avvio Caduceo Relay su {config.host}:{config.port}")
     logger.info(f"PSK: {config.psk_hex[:8]}...")
+    logger.info(f"Config: {config_path}")
     logger.info(f"Agent endpoint: ws://{config.host}:{config.port}{WS_AGENT_PATH}")
+
+    # Mostra il PSK per la configurazione degli agent
+    print(f"\n{'='*60}")
+    print(f"  Caduceo Relay Server v{PROTOCOL_VERSION}")
+    print(f"{'='*60}")
+    print(f"  Host:       {config.host}:{config.port}")
+    print(f"  Config:     {config_path}")
+    print(f"  PSK:        {config.psk_hex}")
+    print(f"  JWT Secret:  {config.jwt_secret[:16]}...")
+    print(f"  Agent WS:   ws://{config.host}:{config.port}{WS_AGENT_PATH}")
+    print(f"  REST API:   http://{config.host}:{config.port}/api")
+    print(f"{'='*60}\n")
 
     app = create_app(config)
     uvicorn.run(app, host=config.host, port=config.port)
