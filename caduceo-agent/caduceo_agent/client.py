@@ -102,23 +102,29 @@ class ShellExecutor:
         else:
             full_cmd = command
 
-        # Su Windows: usa cmd /c per garantire che i comandi vengano trovati
-        # Su Linux/macOS: usa la shell nativa
+        # Su Windows: subprocess.run() che eredita PATH e env di sistema
+        # Su Linux/macOS: asyncio.create_subprocess_shell per non bloccare
         start_time = time.time()
 
         try:
             if os.name == "nt":
-                # Windows: cmd.exe /c per cercare nel PATH e supportare built-in
-                # Non usiamo executable perche' asyncio su Windows ha un bug
-                # con create_subprocess_shell quando executable e' specificato.
-                # Invece prependiamo "cmd /c" al comando stesso.
-                proc = await asyncio.create_subprocess_shell(
-                    f"cmd /c {full_cmd}",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                # Windows: subprocess.run e' piu' affidabile per ereditare PATH
+                # asyncio.create_subprocess_shell non eredita il PATH su Windows
+                result = subprocess.run(
+                    full_cmd,
+                    shell=True,
+                    capture_output=True,
+                    timeout=timeout,
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
                 )
+                return {
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout.decode("utf-8", errors="replace"),
+                    "stderr": result.stderr.decode("utf-8", errors="replace"),
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                }
             else:
-                # Linux/macOS
+                # Linux/macOS: asyncio per non bloccare l'event loop
                 if shell == "powershell":
                     executable = shutil.which("pwsh") or "powershell"
                 elif shell == "zsh":
@@ -135,16 +141,16 @@ class ShellExecutor:
                     executable=executable,
                 )
 
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
 
-            return {
-                "exit_code": proc.returncode,
-                "stdout": stdout.decode("utf-8", errors="replace"),
-                "stderr": stderr.decode("utf-8", errors="replace"),
-                "duration_ms": int((time.time() - start_time) * 1000),
-            }
+                return {
+                    "exit_code": proc.returncode,
+                    "stdout": stdout.decode("utf-8", errors="replace"),
+                    "stderr": stderr.decode("utf-8", errors="replace"),
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                }
 
         except asyncio.TimeoutError:
             proc.kill()
