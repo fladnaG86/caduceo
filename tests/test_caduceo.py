@@ -344,3 +344,158 @@ class TestUtils:
 
         assert id1 != id2
         assert id1.startswith("req-")
+
+
+# ── WebSocket + Crypto Integration Tests ──────────────────────────────────────
+
+class TestWebSocketCryptoIntegration:
+    """Test integrazione WebSocket con crittografia AES-256-GCM."""
+
+    def test_encrypt_decrypt_command_roundtrip(self):
+        """Verifica che un comando crittografato dal relay sia leggibile dall'agent."""
+        from caduceo_common.crypto import Crypto
+
+        psk_hex = Crypto().generate_key_hex()
+        relay_crypto = Crypto.from_hex(psk_hex)
+        agent_crypto = Crypto.from_hex(psk_hex)
+
+        command_msg = {
+            "type": "command",
+            "command": "bash",
+            "args": ["-c", "echo hello"],
+            "timeout": 30,
+            "request_id": "req-test-001",
+        }
+
+        # Relay cifra il comando
+        encrypted = relay_crypto.encrypt_message(command_msg)
+        assert "nonce_b64" in encrypted
+        assert "ciphertext_b64" in encrypted
+
+        # Agent decifra
+        decrypted = agent_crypto.decrypt_message(encrypted)
+        assert decrypted["type"] == "command"
+        assert decrypted["command"] == "bash"
+        assert decrypted["args"] == ["-c", "echo hello"]
+        assert decrypted["request_id"] == "req-test-001"
+
+    def test_encrypt_decrypt_response_roundtrip(self):
+        """Verifica che una risposta crittografata dall'agent sia leggibile dal relay."""
+        from caduceo_common.crypto import Crypto
+
+        psk_hex = Crypto().generate_key_hex()
+        relay_crypto = Crypto.from_hex(psk_hex)
+        agent_crypto = Crypto.from_hex(psk_hex)
+
+        response_msg = {
+            "type": "command_response",
+            "request_id": "req-test-001",
+            "agent_id": "pc-ufficio-01",
+            "exit_code": 0,
+            "stdout": "hello\n",
+            "stderr": "",
+            "duration_ms": 42,
+        }
+
+        # Agent cifra la risposta
+        encrypted = agent_crypto.encrypt_message(response_msg)
+
+        # Relay decifra
+        decrypted = relay_crypto.decrypt_message(encrypted)
+        assert decrypted["type"] == "command_response"
+        assert decrypted["exit_code"] == 0
+        assert decrypted["stdout"] == "hello\n"
+
+    def test_encrypt_decrypt_heartbeat(self):
+        """Verifica che gli heartbeat siano crittografati correttamente."""
+        from caduceo_common.crypto import Crypto
+
+        psk_hex = Crypto().generate_key_hex()
+        crypto = Crypto.from_hex(psk_hex)
+
+        heartbeat = {
+            "type": "heartbeat",
+            "agent_id": "pc-test",
+            "timestamp": 1714723200,
+            "stats": {"cpu_percent": 45.2, "memory_percent": 62.1, "disk_percent": 73.0},
+        }
+
+        encrypted = crypto.encrypt_message(heartbeat)
+        decrypted = crypto.decrypt_message(encrypted)
+        assert decrypted["type"] == "heartbeat"
+        assert decrypted["stats"]["cpu_percent"] == 45.2
+
+    def test_register_with_psk_challenge(self):
+        """Verifica che il messaggio di registrazione contenga la PSK challenge."""
+        from caduceo_common.crypto import Crypto
+
+        psk_hex = Crypto().generate_key_hex()
+        import hashlib
+
+        agent_id = "pc-ufficio-01"
+        expected_challenge = hashlib.sha256(
+            (psk_hex + agent_id).encode()
+        ).hexdigest()
+
+        # Simula verifica lato relay
+        register_msg = {
+            "type": "register",
+            "agent_id": agent_id,
+            "psk_challenge": expected_challenge,
+            "hostname": "DESKTOP-A1B2C3",
+            "os": "linux",
+        }
+
+        # Relay verifica
+        verify_challenge = hashlib.sha256(
+            (psk_hex + register_msg["agent_id"]).encode()
+        ).hexdigest()
+        assert register_msg["psk_challenge"] == verify_challenge
+
+    def test_wrong_psk_fails_decryption(self):
+        """Verifica che PSK diversi non possano decifrare i messaggi."""
+        from caduceo_common.crypto import Crypto
+
+        relay_crypto = Crypto()  # PSK random
+        agent_crypto = Crypto()  # PSK diversa
+
+        msg = {"type": "command", "command": "ls"}
+        encrypted = relay_crypto.encrypt_message(msg)
+
+        with pytest.raises(Exception):
+            agent_crypto.decrypt_message(encrypted)
+
+    def test_encrypted_frame_structure(self):
+        """Verifica che i frame crittografati abbiano la struttura corretta."""
+        from caduceo_common.crypto import Crypto
+
+        crypto = Crypto()
+        msg = {"type": "heartbeat", "agent_id": "test"}
+        encrypted = crypto.encrypt_message(msg)
+
+        # Un frame crittografato deve avere nonce + ciphertext
+        assert "nonce_b64" in encrypted
+        assert "ciphertext_b64" in encrypted
+
+        import base64
+
+        nonce = base64.b64decode(encrypted["nonce_b64"])
+        ciphertext = base64.b64decode(encrypted["ciphertext_b64"])
+
+        assert len(nonce) == 12  # 96 bit nonce per AES-GCM
+        assert len(ciphertext) > 16  # ciphertext + 16 byte auth tag
+
+    def test_unicode_in_encrypted_messages(self):
+        """Verifica che caratteri Unicode sopravvivano alla crittografia."""
+        from caduceo_common.crypto import Crypto
+
+        crypto = Crypto()
+        msg = {
+            "type": "command_response",
+            "stdout": "Risultato: àèéìòù € 🎉 ñ",
+            "exit_code": 0,
+        }
+
+        encrypted = crypto.encrypt_message(msg)
+        decrypted = crypto.decrypt_message(encrypted)
+        assert decrypted["stdout"] == "Risultato: àèéìòù € 🎉 ñ"
