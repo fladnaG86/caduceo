@@ -105,16 +105,24 @@ class ShellExecutor:
         start_time = time.time()
 
         try:
-            # Usa shell appropriata per il OS
-            if shell == "powershell":
-                # Su Windows: 'powershell' per PS5, 'pwsh' per PS7
-                executable = "pwsh" if shutil.which("pwsh") else "powershell"
-            elif shell == "zsh":
-                executable = "/bin/zsh"
-            elif shell == "bash":
-                executable = "/bin/bash"
+            # Su Windows: usa cmd.exe (sempre disponibile) di default
+            # PowerShell solo se richiesto esplicitamente
+            if os.name == "nt":
+                if shell == "powershell":
+                    executable = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+                else:
+                    # cmd.exe e' la shell nativa su Windows, sempre disponibile
+                    executable = None  # Lascia che Python usi cmd.exe
             else:
-                executable = None  # Default shell
+                # Linux/macOS
+                if shell == "powershell":
+                    executable = shutil.which("pwsh") or "powershell"
+                elif shell == "zsh":
+                    executable = "/bin/zsh"
+                elif shell == "bash":
+                    executable = "/bin/bash"
+                else:
+                    executable = None
 
             proc = await asyncio.create_subprocess_shell(
                 full_cmd,
