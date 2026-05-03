@@ -108,23 +108,15 @@ class ShellExecutor:
 
         try:
             if os.name == "nt":
-                # Windows: passa il comando a cmd /c per garantire ricerca nel PATH
-                # e supporto di comandi built-in (dir, type, etc.)
-                if shell == "powershell":
-                    ps_exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
-                    proc = await asyncio.create_subprocess_shell(
-                        full_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        executable=ps_exe,
-                    )
-                else:
-                    proc = await asyncio.create_subprocess_shell(
-                        full_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        executable="cmd.exe",
-                    )
+                # Windows: cmd.exe /c per cercare nel PATH e supportare built-in
+                # Non usiamo executable perche' asyncio su Windows ha un bug
+                # con create_subprocess_shell quando executable e' specificato.
+                # Invece prependiamo "cmd /c" al comando stesso.
+                proc = await asyncio.create_subprocess_shell(
+                    f"cmd /c {full_cmd}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             else:
                 # Linux/macOS
                 if shell == "powershell":
