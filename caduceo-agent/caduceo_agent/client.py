@@ -102,17 +102,29 @@ class ShellExecutor:
         else:
             full_cmd = command
 
+        # Su Windows: usa cmd /c per garantire che i comandi vengano trovati
+        # Su Linux/macOS: usa la shell nativa
         start_time = time.time()
 
         try:
-            # Su Windows: usa cmd.exe (sempre disponibile) di default
-            # PowerShell solo se richiesto esplicitamente
             if os.name == "nt":
+                # Windows: passa il comando a cmd /c per garantire ricerca nel PATH
+                # e supporto di comandi built-in (dir, type, etc.)
                 if shell == "powershell":
-                    executable = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+                    ps_exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+                    proc = await asyncio.create_subprocess_shell(
+                        full_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        executable=ps_exe,
+                    )
                 else:
-                    # cmd.exe e' la shell nativa su Windows, sempre disponibile
-                    executable = None  # Lascia che Python usi cmd.exe
+                    proc = await asyncio.create_subprocess_shell(
+                        full_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        executable="cmd.exe",
+                    )
             else:
                 # Linux/macOS
                 if shell == "powershell":
@@ -124,12 +136,12 @@ class ShellExecutor:
                 else:
                     executable = None
 
-            proc = await asyncio.create_subprocess_shell(
-                full_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                executable=executable,
-            )
+                proc = await asyncio.create_subprocess_shell(
+                    full_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    executable=executable,
+                )
 
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
