@@ -1,0 +1,47 @@
+# Caduceo Relay - Caddy reverse proxy
+# Quando il DNS sara' configurato (caduceo.maulanhermes.uk -> 195.32.126.19),
+# Caddy otterra' automaticamente certificati Let's Encrypt.
+
+# Per ora: listen su porta 80/443 e proxy verso il relay locale
+# Quando il DNS e' pronto, sostituire :80 con caduceo.maulanhermes.uk
+
+# === PRODUZIONE (con TLS automatico) ===
+# Scommentare quando il DNS caduceo.maulanhermes.uk punta a questo server:
+#
+# caduceo.maulanhermes.uk {
+#     reverse_proxy localhost:8443
+#
+#     # WebSocket upgrade headers
+#     header_up Host {host}
+#     header_up X-Real-IP {remote_host}
+#     header_up X-Forwarded-For {remote_host}
+#     header_up X-Forwarded-Proto {scheme}
+#
+#     # WebSocket path
+#     handle_path /agent {
+#         reverse_proxy localhost:8443
+#     }
+#
+#     # REST API
+#     handle_path /api/* {
+#         reverse_proxy localhost:8443
+#     }
+#
+#     # Health check pubblico
+#     handle /api/health {
+#         reverse_proxy localhost:8443
+#     }
+#
+#     log {
+#         output file /var/log/caddy/caduceo.log
+#     }
+# }
+
+# === SVILUPPO (senza TLS, solo locale) ===
+:8400 {
+    reverse_proxy localhost:8443
+
+    log {
+        output file /var/log/caddy/caduceo.log
+    }
+}

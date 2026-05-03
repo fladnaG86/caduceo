@@ -8,7 +8,7 @@ Type=simple
 User=manutenzione
 Group=manutenzione
 WorkingDirectory=/home/manutenzione/caduceo
-ExecStart=/home/manutenzione/caduceo/venv/bin/python -m caduceo_relay
+ExecStart=/home/manutenzione/caduceo/venv/bin/python -m caduceo_relay --config /home/manutenzione/.caduceo/relay.json
 Restart=on-failure
 RestartSec=5
 StartLimitBurst=5
@@ -20,10 +20,6 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/manutenzione/.caduceo /tmp
 PrivateTmp=true
-
-# Environment - PSK e JWT.secret dal file config
-# Non passare secrets come argomenti CLI!
-Environment=CADUCEO_RELAY_CONFIG=/home/manutenzione/.caduceo/relay.json
 
 # Logging
 StandardOutput=journal
