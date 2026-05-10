@@ -23,7 +23,11 @@ env/
 .caduceo/
 *.env
 relay.json
-config.json
+agent.json
+credentials.json
+
+# Deploy wheels (regenerated from source)
+deploy/*.whl
 
 # Logs
 *.log
@@ -31,6 +35,7 @@ config.json
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Test
 .pytest_cache/
@@ -40,3 +45,6 @@ Thumbs.db
 # Coverage
 htmlcov/
 .coverage
+
+# NAS staging
+*.bak

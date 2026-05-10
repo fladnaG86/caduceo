@@ -144,10 +144,15 @@ class ShellExecutor:
         shell = shell or ShellExecutor.detect_shell()
 
         # Costruisci il comando completo in modo sicuro
-        # Usa shlex.quote per escapare gli argomenti se forniti separatamente
+        # Su Windows: usare doppioni apici (stile cmd.exe) per gli argomenti
+        # Su Linux/macOS: usare shlex.quote (stile POSIX)
         if args:
-            import shlex
-            full_cmd = f"{command} {' '.join(shlex.quote(a) for a in args)}"
+            if os.name == "nt":
+                # Windows: subprocess.list2cmdline produce quoting corretto per cmd.exe
+                full_cmd = subprocess.list2cmdline([command] + args)
+            else:
+                import shlex
+                full_cmd = f"{command} {' '.join(shlex.quote(a) for a in args)}"
         else:
             full_cmd = command
 
