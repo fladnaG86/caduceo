@@ -12,7 +12,7 @@ ExecStart=/home/manutenzione/caduceo/venv/bin/python -m caduceo_relay --config /
 Restart=on-failure
 RestartSec=5
 StartLimitBurst=5
-StartLimitIntervalSec=60
+
 
 # Sicurezza
 NoNewPrivileges=true

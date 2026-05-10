@@ -1,0 +1,19 @@
+[Unit]
+Description=Zrok Public Share for Caduceo Relay (reserved: caduceo.shares.zrok.io)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=manutenzione
+Group=manutenzione
+Environment=HOME=/home/manutenzione
+Environment=PATH=/home/manutenzione/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/manutenzione/.local/bin/zrok share public http://localhost:8443 --headless --name-selection public:caduceo --open
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -23,7 +23,8 @@ class Message:
             self.request_id = generate_request_id()
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if v != ""}
+        """Serializza il messaggio. NON filtra valori falsy (0, False) che sono validi."""
+        return {k: v for k, v in self.__dict__.items() if v is not None}
 
     @classmethod
     def from_dict(cls, data: dict) -> "Message":

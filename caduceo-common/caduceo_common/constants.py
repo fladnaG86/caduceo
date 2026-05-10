@@ -15,10 +15,11 @@ WS_API_PATH = "/api"
 HEARTBEAT_INTERVAL = 30  # secondi
 HEARTBEAT_TIMEOUT = 90   # secondi (3x interval)
 
-# Reconnect backoff (esponenziale)
+# Reconnect backoff (esponenziale con jitter)
 RECONNECT_INITIAL = 1.0   # secondi
 RECONNECT_MAX = 60.0      # secondi
 RECONNECT_MULTIPLIER = 2.0
+RECONNECT_JITTER_MAX = 1.0  # secondi di jitter random per thundering herd
 
 # Comandi
 COMMAND_TIMEOUT_DEFAULT = 30    # secondi
@@ -35,9 +36,15 @@ CRYPTO_KEY_LENGTH = 32           # bytes (256 bit)
 CRYPTO_NONCE_LENGTH = 12        # bytes (96 bit)
 CRYPTO_TAG_LENGTH = 16           # bytes (128 bit)
 
+# Auth challenge
+AUTH_NONCE_LENGTH = 32           # bytes (256 bit) per challenge server
+
 # JWT
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY = 3600  # 1 ora per token API
+
+# Heartbeat encryption
+HEARTBEAT_ENCRYPTED = True  # Crittografa heartbeat post-auth
 
 # File transfer
 FILE_CHUNK_SIZE = 1024 * 1024  # 1 MB
@@ -65,7 +72,9 @@ class MessageType:
     ERROR = "error"
 
     # Relay → Agent
+    AUTH_CHALLENGE = "auth_challenge"  # Server invia nonce per PSK challenge-response
     COMMAND = "command"
+    HEARTBEAT_ACK = "heartbeat_ack"
     FILE_DOWNLOAD = "file_download"
     FILE_UPLOAD = "file_upload"
     SCREENSHOT = "screenshot"

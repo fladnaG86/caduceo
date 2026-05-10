@@ -28,7 +28,8 @@ class Crypto:
         """Crea Crypto da chiave base64."""
         return cls(base64.b64decode(b64_key))
 
-    def generate_key_hex(self) -> str:
+    @staticmethod
+    def generate_key_hex() -> str:
         """Genera una nuova chiave e la restituisce in hex (per configurazione)."""
         key = AESGCM.generate_key(bit_length=256)
         return key.hex()

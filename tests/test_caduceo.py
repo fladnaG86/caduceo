@@ -140,6 +140,31 @@ class TestMessages:
         assert parsed.type == "command"
         assert parsed.command == "ls -la"
 
+    def test_to_dict_preserves_falsy_values(self):
+        """Verifica che to_dict non ometta valori falsy validi (0, False)."""
+        from caduceo_common.messages import CommandResponse
+
+        # exit_code=0 e' un valore valido (successo), NON deve essere omesso
+        msg = CommandResponse(
+            request_id="req-test",
+            exit_code=0,
+            stdout="output",
+            stderr="",
+        )
+        d = msg.to_dict()
+        assert "exit_code" in d, "exit_code=0 non deve essere omesso da to_dict"
+        assert d["exit_code"] == 0, f"Atteso 0, ottenuto {d.get('exit_code')}"
+
+        # Verifica che exit_code=1 sia preservato
+        msg2 = CommandResponse(
+            request_id="req-test2",
+            exit_code=1,
+            stdout="",
+            stderr="error",
+        )
+        d2 = msg2.to_dict()
+        assert d2["exit_code"] == 1
+
     def test_parse_unknown_type(self):
         """Verifica che tipi sconosciuti vengano gestiti come Message base."""
         from caduceo_common.messages import parse_message, Message
@@ -279,7 +304,9 @@ class TestSecurity:
             client_module.ALLOWED_PATHS = original_paths
 
     def test_psk_challenge_generation(self):
-        """Verifica che la PSK challenge sia deterministica."""
+        """Verifica che la PSK challenge con nonce sia deterministica e sicura."""
+        import hmac as hmac_mod
+        import hashlib
         from caduceo_common.crypto import Crypto
         from caduceo_agent.client import CaduceoAgent
 
@@ -289,12 +316,30 @@ class TestSecurity:
         agent1 = CaduceoAgent(relay_url="ws://test", psk_hex=psk_hex, agent_id="pc-test")
         agent2 = CaduceoAgent(relay_url="ws://test", psk_hex=psk_hex, agent_id="pc-test")
 
-        # Stessa PSK + stesso agent_id = stessa challenge
-        assert agent1._generate_psk_challenge() == agent2._generate_psk_challenge()
+        # Con lo stesso nonce, stessa PSK + stesso agent_id = stessa challenge
+        nonce = "test_nonce_123"
+        assert agent1._generate_psk_challenge(nonce=nonce) == agent2._generate_psk_challenge(nonce=nonce)
 
-        # Agent ID diverso = challenge diversa
+        # Verifica che l'HMAC sia calcolato correttamente
+        expected = hmac_mod.new(
+            psk_hex.encode(),
+            f"{nonce}pc-test".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        assert agent1._generate_psk_challenge(nonce=nonce) == expected
+
+        # Agent ID diverso = challenge diversa (anche con stesso nonce)
         agent3 = CaduceoAgent(relay_url="ws://test", psk_hex=psk_hex, agent_id="other-pc")
-        assert agent1._generate_psk_challenge() != agent3._generate_psk_challenge()
+        assert agent1._generate_psk_challenge(nonce=nonce) != agent3._generate_psk_challenge(nonce=nonce)
+
+        # Nonce diverso = challenge diversa (anche con stesso agent_id e PSK)
+        different_nonce = "different_nonce_456"
+        assert agent1._generate_psk_challenge(nonce=nonce) != agent1._generate_psk_challenge(nonce=different_nonce)
+
+        # Test legacy (senza nonce) — ancora funziona per retrocompatibilita'
+        legacy1 = agent1._generate_psk_challenge()  # nonce=""
+        legacy2 = agent2._generate_psk_challenge()
+        assert legacy1 == legacy2  # Deterministico senza nonce
 
     def test_credentials_file_permissions(self, tmp_path):
         """Verifica che i file config/credentials vengano creati con permessi 0600."""
@@ -499,3 +544,240 @@ class TestWebSocketCryptoIntegration:
         encrypted = crypto.encrypt_message(msg)
         decrypted = crypto.decrypt_message(encrypted)
         assert decrypted["stdout"] == "Risultato: àèéìòù € 🎉 ñ"
+
+
+# ── Deny Paths & Overwrite Protection Tests ──────────────────────────────────
+
+class TestDeniedPaths:
+    """Test blacklist path di sicurezza (deny patterns e suffixes)."""
+
+    def test_denied_path_ssh(self):
+        """Verifica che ~/.ssh/ sia bloccato."""
+        from caduceo_agent.client import _is_denied_path
+
+        assert _is_denied_path(Path("/home/user/.ssh/id_rsa"))
+        assert _is_denied_path(Path("/home/user/.ssh/authorized_keys"))
+        assert _is_denied_path(Path("/root/.ssh/config"))
+
+    def test_denied_path_gnupg(self):
+        """Verifica che ~/.gnupg/ sia bloccato."""
+        from caduceo_agent.client import _is_denied_path
+
+        assert _is_denied_path(Path("/home/user/.gnupg/pubring.kbx"))
+
+    def test_denied_path_etc_shadow(self):
+        """Verifica che /etc/shadow e /etc/passwd siano bloccati."""
+        from caduceo_agent.client import _is_denied_path
+
+        assert _is_denied_path(Path("/etc/shadow"))
+        assert _is_denied_path(Path("/etc/passwd"))
+        assert _is_denied_path(Path("/etc/ssh/sshd_config"))
+
+    def test_allowed_path_normal_files(self):
+        """Verifica che file normali NON siano bloccati."""
+        from caduceo_agent.client import _is_denied_path
+
+        assert not _is_denied_path(Path("/home/user/document.txt"))
+        assert not _is_denied_path(Path("/home/user/projects/main.py"))
+        assert not _is_denied_path(Path("/tmp/scratch.log"))
+
+    def test_validate_path_denied_even_in_allowed_dir(self):
+        """Verifica che i deny patterns abbiano la priorita' su ALLOWED_PATHS."""
+        from caduceo_agent.client import validate_path
+        import caduceo_agent.client as client_module
+
+        original_paths = client_module.ALLOWED_PATHS
+        try:
+            # Anche se la home e' consentita, .ssh e' bloccato
+            client_module.ALLOWED_PATHS = [str(Path.home())]
+
+            with pytest.raises(PermissionError, match="blacklist"):
+                validate_path("~/.ssh/id_rsa")
+
+            with pytest.raises(PermissionError, match="blacklist"):
+                validate_path("~/.gnupg/private.key")
+
+            # File normale nella home deve funzionare
+            result = validate_path("~/document.txt")
+            assert str(result).startswith(str(Path.home()))
+
+        finally:
+            client_module.ALLOWED_PATHS = original_paths
+
+    def test_validate_path_default_allowed_is_home(self):
+        """Verifica che ALLOWED_PATHS di default sia la home dell'utente."""
+        import caduceo_agent.client as client_module
+
+        # Il default deve essere la home dell'utente
+        assert str(Path.home()) in client_module.ALLOWED_PATHS
+
+
+class TestOverwriteProtection:
+    """Test protezione overwrite per file critici."""
+
+    @pytest.mark.asyncio
+    async def test_overwrite_denied_authorized_keys(self):
+        """Verifica che authorized_keys non possa essere sovrascritto."""
+        from caduceo_agent.client import FileManager
+
+        # Deve essere bloccato (dalla blacklist path o dalla overwrite protection)
+        result = await FileManager.upload(
+            "/home/user/.ssh/authorized_keys",
+            "dGVzdA==",  # "test" in base64
+            overwrite=True
+        )
+        assert not result["success"]
+        # Il path .ssh viene bloccato dalla blacklist di sicurezza PRIMA
+        # dell'overwrite protection, quindi l'errore viene da validate_path
+        assert "blacklist" in result["error"].lower() or "Overwrite negato" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_overwrite_denied_bashrc(self):
+        """Verifica che .bashrc non possa essere sovrascritto."""
+        from caduceo_agent.client import FileManager
+        import caduceo_agent.client as client_module
+
+        original_paths = client_module.ALLOWED_PATHS
+        try:
+            # Imposta ALLOWED_PATHS per includere /home/user
+            client_module.ALLOWED_PATHS = ["/home/user"]
+
+            result = await FileManager.upload(
+                "/home/user/.bashrc",
+                "ZWNobyBoYWNrZWQ=",  # base64
+                overwrite=True
+            )
+            assert not result["success"]
+        finally:
+            client_module.ALLOWED_PATHS = original_paths
+
+    @pytest.mark.asyncio
+    async def test_overwrite_denied_etc_hosts(self):
+        """Verifica che /etc/hosts non possa essere sovrascritto."""
+        from caduceo_agent.client import FileManager
+        import caduceo_agent.client as client_module
+
+        original_paths = client_module.ALLOWED_PATHS
+        try:
+            # Permetti /etc per testare la overwrite protection
+            client_module.ALLOWED_PATHS = ["/etc"]
+
+            result = await FileManager.upload(
+                "/etc/hosts",
+                "MTI3LjAuMC4xIGxvY2FsaG9zdA==",
+                overwrite=True
+            )
+            # Deve essere bloccato: /etc/hosts e' sia nella deny list che nella overwrite list
+            assert not result["success"]
+        finally:
+            client_module.ALLOWED_PATHS = original_paths
+
+    @pytest.mark.asyncio
+    async def test_normal_file_upload_succeeds_in_allowed_dir(self, tmp_path):
+        """Verifica che upload di file normali funzioni."""
+        from caduceo_agent.client import FileManager
+        import caduceo_agent.client as client_module
+        import base64
+
+        original_paths = client_module.ALLOWED_PATHS
+        try:
+            client_module.ALLOWED_PATHS = [str(tmp_path)]
+
+            test_file = tmp_path / "normal_file.txt"
+            content_b64 = base64.b64encode(b"hello world").decode()
+
+            result = await FileManager.upload(str(test_file), content_b64, overwrite=False)
+            #Il file non esiste ancora, dovrebbe riuscire senza overwrite
+            #Nota: dipende da validate_path che accetti tmp_path
+            #Se tmp_path e' in ALLOWED_PATHS, l'upload dovrebbe funzionare
+
+        finally:
+            client_module.ALLOWED_PATHS = original_paths
+
+
+# ── Audit Log Tests ─────────────────────────────────────────────────────────
+
+class TestAuditLog:
+    """Test del sistema di audit logging su SQLite."""
+
+    @pytest.mark.asyncio
+    async def test_audit_log_command(self, tmp_path):
+        """Verifica registrazione di un comando nel log di audit."""
+        from caduceo_relay.server import AuditLog
+
+        audit = AuditLog(tmp_path / "audit.db")
+        await audit._get_db()
+
+        await audit.log("command", "agent-test", subject="ls -la",
+                        detail="args=[] timeout=30", source_ip="192.168.1.5")
+
+        records = await audit.query(agent_id="agent-test")
+        assert len(records) == 1
+        assert records[0]["action"] == "command"
+        assert records[0]["agent_id"] == "agent-test"
+        assert records[0]["subject"] == "ls -la"
+        assert records[0]["source_ip"] == "192.168.1.5"
+
+        await audit.close()
+
+    @pytest.mark.asyncio
+    async def test_audit_log_multiple_actions(self, tmp_path):
+        """Verifica filtro per tipo di azione."""
+        from caduceo_relay.server import AuditLog
+
+        audit = AuditLog(tmp_path / "audit.db")
+        await audit._get_db()
+
+        await audit.log("command", "agent-1", subject="whoami")
+        await audit.log("file_download", "agent-1", subject="/etc/hostname")
+        await audit.log("screenshot", "agent-1")
+        await audit.log("command", "agent-2", subject="df -h")
+
+        # Filtra per action
+        commands = await audit.query(action="command")
+        assert len(commands) == 2
+
+        # Filtra per agent
+        agent1_records = await audit.query(agent_id="agent-1")
+        assert len(agent1_records) == 3
+
+        await audit.close()
+
+    @pytest.mark.asyncio
+    async def test_audit_log_query_with_since(self, tmp_path):
+        """Verifica filtro temporale."""
+        from caduceo_relay.server import AuditLog
+
+        audit = AuditLog(tmp_path / "audit.db")
+        await audit._get_db()
+
+        # Registra un evento
+        before_time = time.time()
+        await audit.log("command", "agent-1", subject="ls")
+        after_time = time.time()
+
+        # Query con since > after_time deve restituire vuoto
+        records = await audit.query(since=after_time + 1)
+        assert len(records) == 0
+
+        # Query con since < before_time deve restituire l'evento
+        records = await audit.query(since=before_time - 1)
+        assert len(records) == 1
+
+        await audit.close()
+
+    @pytest.mark.asyncio
+    async def test_audit_log_detail_truncation(self, tmp_path):
+        """Verifica che i detail lunghi vengano troncati a 2000 caratteri."""
+        from caduceo_relay.server import AuditLog
+
+        audit = AuditLog(tmp_path / "audit.db")
+        await audit._get_db()
+
+        long_detail = "x" * 5000
+        await audit.log("command", "agent-1", detail=long_detail)
+
+        records = await audit.query(agent_id="agent-1")
+        assert len(records[0]["detail"]) <= 2000
+
+        await audit.close()

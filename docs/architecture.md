@@ -10,7 +10,7 @@ Caduceo e' composto da 3 componenti principali che comunicano tramite un protoco
 │                                                                          │
 │  ┌──────────┐        ┌────────────────────────────────┐        ┌────────┐│
 │  │  HERMES   │ HTTPS  │        CLOUDFLARE              │  WSS   │ AGENT  ││
-│  │  Gateway  │←───────│  caduceo.maulanhermes.uk       │←──────│  (PC)  ││
+│  │  Gateway  │←───────│  caduceo.shares.zrok.io       │←──────│  (PC)  ││
 │  │          │        │          │                       │        │        ││
 │  │ - Invia   │        │    cloudflared                 │        │- Shell ││
 │  │   cmd    │ ──→    │       │                         │  ──→   │- File  ││
@@ -75,7 +75,7 @@ File di deploy in `/home/manutenzione/caduceo/deploy/`:
 
 ### Agent → Relay (WebSocket)
 
-Il client si connette in outbound a `wss://caduceo.maulanhermes.uk/ws` e mantiene la connessione aperta con heartbeat.
+Il client si connette in outbound a `wss://caduceo.shares.zrok.io/ws` e mantiene la connessione aperta con heartbeat.
 
 **Registrazione:**
 ```json
@@ -133,7 +133,7 @@ Il client si connette in outbound a `wss://caduceo.maulanhermes.uk/ws` e mantien
 
 ### Hermes → Relay (REST API)
 
-Base URL: `https://caduceo.maulanhermes.uk`
+Base URL: `https://caduceo.shares.zrok.io`
 
 Tutte le API richiedono header `Authorization: Bearer <JWT_TOKEN>`.
 
@@ -215,19 +215,19 @@ Chiave pre-condivisa (PSK)
 
 ### Linux (systemd)
 ```bash
-caduceo-agent install --relay wss://caduceo.maulanhermes.uk/ws --psk ~/.caduceo/agent.psk
+caduceo-agent install --relay wss://caduceo.shares.zrok.io/ws --psk ~/.caduceo/agent.psk
 # Crea /etc/systemd/system/caduceo-agent.service
 ```
 
 ### macOS (launchd)
 ```bash
-caduceo-agent install --relay wss://caduceo.maulanhermes.uk/ws --psk ~/.caduceo/agent.psk
+caduceo-agent install --relay wss://caduceo.shares.zrok.io/ws --psk ~/.caduceo/agent.psk
 # Crea ~/Library/LaunchAgents/com.caduceo.agent.plist
 ```
 
 ### Windows (Windows Service)
 ```powershell
-caduceo-agent install --relay wss://caduceo.maulanhermes.uk/ws --psk %USERPROFILE%\.caduceo\agent.psk
+caduceo-agent install --relay wss://caduceo.shares.zrok.io/ws --psk %USERPROFILE%\.caduceo\agent.psk
 # Registra servizio Windows via pywin32
 ```
 
@@ -291,7 +291,7 @@ Hermes → analizza con vision (gemma4)
 
 ## Note sul Deployment
 
-- **Cloudflare Tunnel**: il traffico passa da `caduceo.maulanhermes.uk` → Cloudflare → `cloudflared` → `localhost:8443`
+- **Cloudflare Tunnel**: il traffico passa da `caduceo.shares.zrok.io` → Cloudflare → `cloudflared` → `localhost:8443`
 - **Nessuna porta aperta** sul router: ISP non puo' bloccare, zero superficie di attacco
 - **Caddy**: usato solo per sviluppo locale sulla porta 8400
 - **JWT Token**: ottenibile solo da localhost tramite `/api/token`

@@ -1,9 +1,12 @@
 """Caduceo Relay - Server principale con FastAPI + WebSocket."""
 
 import asyncio
+import hashlib
+import hmac as hmac_mod
 import json
 import logging
 import os
+import secrets
 import stat
 import time
 from pathlib import Path
@@ -12,6 +15,7 @@ import jwt
 import aiosqlite
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from caduceo_common.constants import (
@@ -20,6 +24,9 @@ from caduceo_common.constants import (
     QUEUE_TTL_DEFAULT,
     QUEUE_MAX_SIZE,
     PROTOCOL_VERSION,
+    JWT_EXPIRY,
+    AUTH_NONCE_LENGTH,
+    HEARTBEAT_ENCRYPTED,
     MessageType,
 )
 from caduceo_common.crypto import Crypto
@@ -43,9 +50,8 @@ class RelayConfig:
 
         # Genera PSK e JWT secret se non presenti
         if not self.psk_hex:
-            self.psk_hex = Crypto().generate_key_hex()
+            self.psk_hex = Crypto.generate_key_hex()
         if not self.jwt_secret:
-            import secrets
             self.jwt_secret = secrets.token_hex(32)
         self.crypto = Crypto.from_hex(self.psk_hex)
 
@@ -81,7 +87,6 @@ class RelayConfig:
             logger.info(f"Config caricata da {path}")
         else:
             # Prima esecuzione: genera PSK e JWT secret, salva
-            import secrets
             config.jwt_secret = secrets.token_hex(32)
             config.save()
             logger.info(f"Nuova config creata e salvata in {path}")
@@ -96,7 +101,7 @@ class RelayConfig:
             "relay_ws_url": f"ws://127.0.0.1:{self.port}",
             "jwt_secret": self.jwt_secret,
             "psk_hex": self.psk_hex,
-            "note": "JWT token can be generated from jwt_secret. For production use WSS and HTTPS on maulanhermes.uk",
+            "note": "JWT token can be generated from jwt_secret. For production use WSS and HTTPS on caduceo.shares.zrok.io",
         }
         creds_path.write_text(json.dumps(data, indent=2))
         os.chmod(creds_path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
@@ -227,28 +232,30 @@ class CommandQueue:
         return self._db
 
     async def enqueue(self, agent_id: str, command: dict):
-        """Mette in coda un comando per agent offline."""
+        """Metti in coda un comando per agent offline. Operazione atomica."""
         db = await self._get_db()
         now = time.time()
         expires_at = now + self.ttl
         command_json = json.dumps(command)
 
-        # Limita la coda per agent (con transazione)
-        async with db.execute(
-            "SELECT COUNT(*) FROM command_queue WHERE agent_id = ?",
-            (agent_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            count = row[0] if row else 0
-        if count >= QUEUE_MAX_SIZE:
-            logger.warning(f"Coda piena per {agent_id} ({count} comandi)")
-            return
+        # Transazione atomica: count + insert
+        async with db.execute("BEGIN IMMEDIATE"):
+            async with db.execute(
+                "SELECT COUNT(*) FROM command_queue WHERE agent_id = ?",
+                (agent_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                count = row[0] if row else 0
+            if count >= QUEUE_MAX_SIZE:
+                logger.warning(f"Coda piena per {agent_id} ({count} comandi)")
+                await db.commit()
+                return
 
-        await db.execute(
-            "INSERT INTO command_queue (agent_id, command, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (agent_id, command_json, now, expires_at)
-        )
-        await db.commit()
+            await db.execute(
+                "INSERT INTO command_queue (agent_id, command, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (agent_id, command_json, now, expires_at)
+            )
+            await db.commit()
         logger.info(f"Comando in coda per {agent_id}: {command.get('type', 'unknown')}")
 
     async def dequeue(self, agent_id: str) -> list[dict]:
@@ -292,6 +299,86 @@ class CommandQueue:
             self._db = None
 
 
+# ── Audit Log (SQLite) ──────────────────────────────────────────────────────
+
+class AuditLog:
+    """Registro di audit per tutti i comandi e operazioni file inviate tramite il relay."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._db: aiosqlite.Connection | None = None
+
+    async def _get_db(self) -> aiosqlite.Connection:
+        if self._db is None:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = await aiosqlite.connect(str(self.db_path))
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    action TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    subject TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    source_ip TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)
+            """)
+            await self._db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id)
+            """)
+            await self._db.commit()
+        return self._db
+
+    async def log(self, action: str, agent_id: str, subject: str = "",
+                  detail: str = "", source_ip: str = ""):
+        """Registra un evento di audit."""
+        db = await self._get_db()
+        now = time.time()
+        await db.execute(
+            "INSERT INTO audit_log (timestamp, action, agent_id, subject, detail, source_ip) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (now, action, agent_id, subject, detail[:2000], source_ip)
+        )
+        await db.commit()
+        # Log strutturato anche su stdout per journald
+        logger.info(f"AUDIT action={action} agent={agent_id} subject={subject!r} "
+                     f"detail={detail[:200]!r} ip={source_ip}")
+
+    async def query(self, agent_id: str = "", action: str = "",
+                    since: float = 0, limit: int = 100) -> list[dict]:
+        """Interroga il log di audit."""
+        db = await self._get_db()
+        conditions = []
+        params = []
+        if agent_id:
+            conditions.append("agent_id = ?")
+            params.append(agent_id)
+        if action:
+            conditions.append("action = ?")
+            params.append(action)
+        if since:
+            conditions.append("timestamp >= ?")
+            params.append(since)
+        where = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        cursor = await db.execute(
+            f"SELECT * FROM audit_log WHERE {where} ORDER BY timestamp DESC LIMIT ?",
+            params
+        )
+        rows = await cursor.fetchall()
+        columns = ["id", "timestamp", "action", "agent_id", "subject", "detail", "source_ip"]
+        return [dict(zip(columns, row)) for row in rows]
+
+    async def close(self):
+        if self._db:
+            await self._db.close()
+            self._db = None
+
+
 # ── App FastAPI ─────────────────────────────────────────────────────────────
 
 def create_app(config: RelayConfig | None = None) -> FastAPI:
@@ -317,17 +404,145 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
     registry = AgentRegistry()
     queue = CommandQueue(config.db_path, config.queue_ttl)
+    audit = AuditLog(config.db_path.parent / "audit.db")
     crypto = config.crypto
 
     # Inizializza DB all'avvio
     @app.on_event("startup")
     async def startup():
         await queue._get_db()
-        logger.info("CommandQueue DB inizializzato")
+        await audit._get_db()
+        logger.info("CommandQueue + AuditLog DB inizializzati")
 
     @app.on_event("shutdown")
     async def shutdown():
         await queue.close()
+        await audit.close()
+
+    # ── Public Download Endpoint ────────────────────────────────────────────
+
+    INSTALLER_DIR = Path("/mnt/nas_hermes/Cartella Agent Hermes")
+    DEPLOY_DIR = Path("/home/manutenzione/caduceo/deploy")
+
+    @app.get("/download/install.py")
+    async def download_installer(platform: str = "windows"):
+        """Download the Caduceo Agent installer. Public, no auth required.
+        ?platform=windows|linux|macos"""
+        platform = platform.lower()
+        if platform not in ("windows", "linux", "macos"):
+            raise HTTPException(400, f"Platform non valida: {platform}. Usa: windows, linux, macos")
+        # Prova prima sul NAS, poi fallback su deploy locale
+        installer_path = INSTALLER_DIR / platform / "install.py"
+        if not installer_path.exists():
+            # Fallback: cerca nel deploy locale
+            local_candidates = list(DEPLOY_DIR.glob("install*windows*.py"))
+            if platform == "windows" and local_candidates:
+                installer_path = local_candidates[0]
+            else:
+                raise HTTPException(404, f"Installer per {platform} non trovato (NAS non montato, nessun fallback locale)")
+        return FileResponse(
+            installer_path,
+            filename=f"caduceo-agent-install-{platform}.py",
+            media_type="text/x-python",
+        )
+
+    @app.get("/download/quick-install.ps1")
+    async def download_quick_install_ps1():
+        """Download the Windows PowerShell quick-install script. Public, no auth required."""
+        path = DEPLOY_DIR / "quick-install.ps1"
+        if not path.exists():
+            raise HTTPException(404, "quick-install.ps1 non trovato")
+        return FileResponse(path, filename="quick-install.ps1", media_type="text/plain")
+
+    @app.get("/download/quick-install.bat")
+    async def download_quick_install_bat():
+        """Download the Windows batch quick-install script. Public, no auth required."""
+        path = DEPLOY_DIR / "quick-install.bat"
+        if not path.exists():
+            raise HTTPException(404, "quick-install.bat non trovato")
+        return FileResponse(path, filename="quick-install.bat", media_type="text/plain")
+
+    @app.get("/download/quick-install.sh")
+    async def download_quick_install_sh():
+        """Download the Linux/macOS quick-install script. Public, no auth required."""
+        path = DEPLOY_DIR / "quick-install.sh"
+        if not path.exists():
+            raise HTTPException(404, "quick-install.sh non trovato")
+        return FileResponse(path, filename="quick-install.sh", media_type="text/x-shellscript")
+
+    @app.get("/download/bootstrap-install.ps1")
+    async def download_bootstrap_ps1():
+        """Download the Windows bootstrap installer (works without Python). Public, no auth required."""
+        path = DEPLOY_DIR / "bootstrap-install.ps1"
+        if not path.exists():
+            raise HTTPException(404, "bootstrap-install.ps1 non trovato")
+        return FileResponse(path, filename="bootstrap-install.ps1", media_type="text/plain")
+
+    @app.get("/download/bootstrap-install.bat")
+    async def download_bootstrap_bat():
+        """Download the Windows bootstrap batch installer. Public, no auth required."""
+        path = DEPLOY_DIR / "bootstrap-install.bat"
+        if not path.exists():
+            raise HTTPException(404, "bootstrap-install.bat non trovato")
+        return FileResponse(path, filename="bootstrap-install.bat", media_type="text/plain")
+
+    @app.get("/download/install-agent.ps1")
+    async def download_install_agent_ps1():
+        """Download the unified Windows installer script. Public, no auth required."""
+        path = DEPLOY_DIR / "install-agent.ps1"
+        if not path.exists():
+            raise HTTPException(404, "install-agent.ps1 non trovato")
+        return FileResponse(path, filename="install-agent.ps1", media_type="text/plain")
+
+    @app.get("/download/install-agent.bat")
+    async def download_install_agent_bat():
+        """Download the unified Windows installer batch wrapper. Public, no auth required."""
+        path = DEPLOY_DIR / "install-agent.bat"
+        if not path.exists():
+            raise HTTPException(404, "install-agent.bat non trovato")
+        return FileResponse(path, filename="install-agent.bat", media_type="text/plain")
+
+    @app.get("/download/caduceo-setup.ps1")
+    async def download_caduceo_setup_ps1():
+        """Download the self-contained Windows installer PS1 (no Python needed). Public, no auth required."""
+        path = DEPLOY_DIR / "caduceo-setup.ps1"
+        if not path.exists():
+            raise HTTPException(404, "caduceo-setup.ps1 non trovato")
+        return FileResponse(path, filename="caduceo-setup.ps1", media_type="text/plain")
+
+    @app.get("/download/caduceo-setup.bat")
+    async def download_caduceo_setup_bat():
+        """Download the self-contained Windows installer BAT launcher. Public, no auth required."""
+        path = DEPLOY_DIR / "caduceo-setup.bat"
+        if not path.exists():
+            raise HTTPException(404, "caduceo-setup.bat non trovato")
+        return FileResponse(path, filename="caduceo-setup.bat", media_type="text/plain")
+
+    @app.get("/download/caduceo_common.whl")
+    async def download_common_whl():
+        """Download caduceo-common wheel. Public, no auth required."""
+        import glob
+        # Try deploy dir first, then dist dirs
+        candidates = list(DEPLOY_DIR.glob("caduceo_common*.whl"))
+        # Also check common/dist
+        common_dist = Path("/home/manutenzione/caduceo/caduceo-common/dist")
+        if common_dist.exists():
+            candidates += list(common_dist.glob("caduceo_common*.whl"))
+        if not candidates:
+            raise HTTPException(404, "caduceo-common wheel non trovato")
+        return FileResponse(candidates[-1], filename="caduceo_common-0.1.0-py3-none-any.whl", media_type="application/octet-stream")
+
+    @app.get("/download/caduceo_agent.whl")
+    async def download_agent_whl():
+        """Download caduceo-agent wheel. Public, no auth required."""
+        import glob
+        candidates = list(DEPLOY_DIR.glob("caduceo_agent*.whl"))
+        agent_dist = Path("/home/manutenzione/caduceo/caduceo-agent/dist")
+        if agent_dist.exists():
+            candidates += list(agent_dist.glob("caduceo_agent*.whl"))
+        if not candidates:
+            raise HTTPException(404, "caduceo-agent wheel non trovato")
+        return FileResponse(candidates[-1], filename="caduceo_agent-0.1.0-py3-none-any.whl", media_type="application/octet-stream")
 
     # ── JWT Auth ─────────────────────────────────────────────────────────
 
@@ -348,13 +563,18 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
     @app.websocket(WS_AGENT_PATH)
     async def agent_endpoint(ws: WebSocket):
-        """Endpoint WebSocket per agent remoti. Richiede autenticazione PSK."""
+        """Endpoint WebSocket per agent remoti. Richiede autenticazione PSK con challenge-response."""
         await ws.accept()
         agent_info = None
 
         try:
-            # Fase 1: attesa auth con timeout di 10 secondi
+            # Fase 1: invio nonce al server (challenge) e attesa risposta con HMAC
+            auth_nonce = secrets.token_hex(AUTH_NONCE_LENGTH)
             try:
+                # Invia il nonce all'agent
+                await ws.send_json({"type": MessageType.AUTH_CHALLENGE, "nonce": auth_nonce})
+
+                # Attendi la risposta di registrazione con timeout di 10 secondi
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
             except asyncio.TimeoutError:
                 await ws.close(code=4003, reason="Auth timeout")
@@ -367,7 +587,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 await ws.close(code=4002, reason="JSON non valido")
                 return
 
-            # Verifica autenticazione PSK: il primo messaggio deve essere register con psk_challenge
+            # Verifica autenticazione PSK: l'agent deve inviare HMAC-SHA256(psk, nonce||agent_id)
             msg_type = msg_data.get("type", "")
             psk_challenge = msg_data.get("psk_challenge", "")
 
@@ -375,17 +595,17 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 await ws.close(code=4001, reason="Registrazione richiesta")
                 return
 
-            # Verifica PSK: l'agent deve dimostrare di conoscere la chiave
-            # Invia un nonce e verifica che l'agent lo crittografi correttamente
-            # Metodo semplificato: l'agent invia il PSK hash come challenge
-            import hashlib
-            expected_challenge = hashlib.sha256(
-                (config.psk_hex + msg_data.get("agent_id", "")).encode()
+            # Verifica HMAC-SHA256(psk_hex, nonce||agent_id)
+            agent_id = msg_data.get("agent_id", "")
+            expected_hmac = hmac_mod.new(
+                config.psk_hex.encode(),
+                f"{auth_nonce}{agent_id}".encode(),
+                hashlib.sha256,
             ).hexdigest()
 
-            if psk_challenge != expected_challenge:
+            if not hmac_mod.compare_digest(psk_challenge, expected_hmac):
                 await ws.close(code=4003, reason="Autenticazione PSK fallita")
-                logger.warning(f"Tentativo di connessione non autorizzato da agent_id={msg_data.get('agent_id', '?')}")
+                logger.warning(f"Tentativo di connessione non autorizzato da agent_id={agent_id}")
                 return
 
             msg = parse_message(msg_data)
@@ -398,6 +618,11 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             agent_info.tags = getattr(msg, "tags", [])
 
             await registry.register(agent_info)
+
+            # Audit: agent registrato
+            await audit.log("agent_register", msg.agent_id,
+                            subject=f"{msg.hostname} {msg.os}",
+                            detail=f"os={msg.os} arch={msg.arch} python={msg.python_version}")
 
             # Invia conferma registrazione
             await ws.send_json({"type": "register_ack", "agent_id": msg.agent_id, "status": "ok"})
@@ -429,29 +654,39 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 if msg.type == MessageType.HEARTBEAT:
                     agent_info.last_heartbeat = time.time()
                     agent_info.stats = getattr(msg, "stats", {})
-                    await ws.send_json({"type": "heartbeat_ack", "timestamp": int(time.time())})
+                    # Crittografa la risposta heartbeat_ack
+                    ack_msg = {"type": MessageType.HEARTBEAT_ACK, "timestamp": int(time.time())}
+                    if HEARTBEAT_ENCRYPTED and crypto:
+                        encrypted_ack = crypto.encrypt_message(ack_msg)
+                        await ws.send_json(encrypted_ack)
+                    else:
+                        await ws.send_json(ack_msg)
 
                 elif msg.type == MessageType.COMMAND_RESPONSE:
                     request_id = msg.request_id
-                    if request_id in registry.pending_responses:
-                        registry.pending_responses[request_id].set_result(msg)
-                        del registry.pending_responses[request_id]
+                    async with registry._lock:
+                        future = registry.pending_responses.pop(request_id, None)
+                    if future and not future.done():
+                        future.set_result(msg)
 
                 elif msg.type in (MessageType.FILE_RESPONSE, MessageType.SCREENSHOT_RESPONSE, MessageType.INFO_RESPONSE):
                     request_id = msg.request_id
-                    if request_id in registry.pending_responses:
-                        registry.pending_responses[request_id].set_result(msg)
-                        del registry.pending_responses[request_id]
+                    async with registry._lock:
+                        future = registry.pending_responses.pop(request_id, None)
+                    if future and not future.done():
+                        future.set_result(msg)
 
                 else:
                     logger.debug(f"Messaggio non gestito da {msg.agent_id}: {msg.type}")
 
         except WebSocketDisconnect:
             if agent_info:
+                await audit.log("agent_disconnect", agent_info.agent_id)
                 registry.unregister(agent_info.agent_id)
         except Exception as e:
             logger.error(f"Errore agent WebSocket: {e}")
             if agent_info:
+                await audit.log("agent_error", agent_info.agent_id, detail=str(e)[:200])
                 registry.unregister(agent_info.agent_id)
 
     # ── REST API: Hermes ─────────────────────────────────────────────────
@@ -471,8 +706,12 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         return agent.to_dict()
 
     @app.post("/api/agents/{agent_id}/command")
-    async def send_command(agent_id: str, cmd: CommandRequest, user: dict = Depends(verify_token)):
+    async def send_command(agent_id: str, cmd: CommandRequest, user: dict = Depends(verify_token), request: Request = None):
         """Invia un comando a un agent."""
+        source_ip = request.client.host if request and request.client else ""
+        await audit.log("command", agent_id, subject=cmd.command,
+                        detail=f"args={cmd.args} timeout={cmd.timeout} shell={cmd.shell}",
+                        source_ip=source_ip)
         agent = registry.get(agent_id)
         if not agent:
             raise HTTPException(404, f"Agent {agent_id} non trovato")
@@ -509,8 +748,10 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(504, f"Timeout comando su {agent_id}")
 
     @app.post("/api/agents/{agent_id}/file/download")
-    async def download_file(agent_id: str, req: FileDownloadRequest, user: dict = Depends(verify_token)):
+    async def download_file(agent_id: str, req: FileDownloadRequest, user: dict = Depends(verify_token), request: Request = None):
         """Richiedi download di un file dall'agent."""
+        source_ip = request.client.host if request and request.client else ""
+        await audit.log("file_download", agent_id, subject=req.path, source_ip=source_ip)
         agent = registry.get(agent_id)
         if not agent:
             raise HTTPException(404, f"Agent {agent_id} non trovato")
@@ -538,8 +779,12 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(504, f"Timeout download file da {agent_id}")
 
     @app.post("/api/agents/{agent_id}/file/upload")
-    async def upload_file(agent_id: str, req: FileUploadRequest, user: dict = Depends(verify_token)):
+    async def upload_file(agent_id: str, req: FileUploadRequest, user: dict = Depends(verify_token), request: Request = None):
         """Upload di un file verso l'agent."""
+        source_ip = request.client.host if request and request.client else ""
+        await audit.log("file_upload", agent_id, subject=req.path,
+                        detail=f"overwrite={req.overwrite} size={len(req.content_b64) if req.content_b64 else 0}",
+                        source_ip=source_ip)
         agent = registry.get(agent_id)
         if not agent:
             raise HTTPException(404, f"Agent {agent_id} non trovato")
@@ -569,8 +814,10 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(504, f"Timeout upload file su {agent_id}")
 
     @app.post("/api/agents/{agent_id}/screenshot")
-    async def take_screenshot(agent_id: str, user: dict = Depends(verify_token)):
+    async def take_screenshot(agent_id: str, user: dict = Depends(verify_token), request: Request = None):
         """Richiedi screenshot dall'agent."""
+        source_ip = request.client.host if request and request.client else ""
+        await audit.log("screenshot", agent_id, source_ip=source_ip)
         agent = registry.get(agent_id)
         if not agent:
             raise HTTPException(404, f"Agent {agent_id} non trovato")
@@ -624,6 +871,14 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 registry.pending_responses.pop(request_id, None)
             return agent.to_dict()
 
+    @app.get("/api/audit")
+    async def query_audit(agent_id: str = "", action: str = "",
+                          since: float = 0, limit: int = 100,
+                          user: dict = Depends(verify_token)):
+        """Interroga il log di audit. Richiede autenticazione JWT."""
+        records = await audit.query(agent_id=agent_id, action=action, since=since, limit=min(limit, 500))
+        return {"records": records, "count": len(records)}
+
     @app.get("/api/health")
     async def health():
         """Health check (no auth required)."""
@@ -653,11 +908,11 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(500, "JWT secret non configurato")
 
         token = jwt.encode(
-            {"sub": req.subject, "role": req.role, "exp": int(time.time()) + 86400 * 30},
+            {"sub": req.subject, "role": req.role, "exp": int(time.time()) + JWT_EXPIRY},
             config.jwt_secret,
             algorithm="HS256"
         )
-        return {"token": token, "expires_in": 86400 * 30}
+        return {"token": token, "expires_in": JWT_EXPIRY}
 
     return app
 

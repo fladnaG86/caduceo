@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Caduceo Agent Installer
-# Usage: curl -sSL https://maulanhermes.uk:8443/install.sh | bash -s -- --id pc-ufficio --tags ufficio,windows
+# Usage: curl -sSL https://caduceo.shares.zrok.io/download/install.sh | bash -s -- --id pc-ufficio --tags ufficio,windows
 # Or:   ./install.sh --id pc-ufficio --tags ufficio,windows
 
 set -euo pipefail
 
-RELAY_URL="wss://maulanhermes.uk:8443"
+RELAY_URL="wss://caduceo.shares.zrok.io"
 PSK=""
 AGENT_ID=""
 TAGS="caduceo"
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --id        Agent ID (required, e.g. pc-ufficio)"
             echo "  --tags      Comma-separated tags (default: caduceo)"
             echo "  --psk       Pre-shared key hex (required for secured relay)"
-            echo "  --relay     Relay URL (default: wss://maulanhermes.uk:8443)"
+            echo "  --relay     Relay URL (default: wss://caduceo.shares.zrok.io)"
             echo "  --install   Install as system service (systemd/launchd)"
             exit 0
             ;;
