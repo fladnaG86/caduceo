@@ -25,7 +25,7 @@ echo   Agent ID: !AGENT_ID!
 echo.
 echo Scaricamento script di installazione...
 
-powershell -Command "Invoke-WebRequest -Uri 'https://caduceo.shares.zrok.io/download/install-agent.ps1' -OutFile '%TEMP%\install-agent.ps1' -UseBasicParsing"
+powershell -Command "Invoke-WebRequest -Uri 'https://your-relay.example.com/download/install-agent.ps1' -OutFile '%TEMP%\install-agent.ps1' -UseBasicParsing"
 
 echo Esecuzione installazione...
 echo.

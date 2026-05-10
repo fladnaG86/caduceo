@@ -34,7 +34,7 @@ if %ERRORLEVEL%==0 (
 if !HAS_PYTHON!==1 (
     echo [1] Python di sistema trovato - uso install.py
     echo.
-    powershell -Command "Invoke-WebRequest -Uri 'https://caduceo.shares.zrok.io/download/install.py?platform=windows' -OutFile '%TEMP%\caduceo-install.py' -UseBasicParsing"
+    powershell -Command "Invoke-WebRequest -Uri 'https://your-relay.example.com/download/install.py?platform=windows' -OutFile '%TEMP%\caduceo-install.py' -UseBasicParsing"
     echo [2] Esecuzione install.py...
     python "%TEMP%\caduceo-install.py"
     goto :done
@@ -46,7 +46,7 @@ echo     Il launcher di Windows Store non e' un Python vero.
 echo     Uso bootstrap con Python embeddable.
 echo.
 echo [2] Scaricamento bootstrap script...
-powershell -Command "Invoke-WebRequest -Uri 'https://caduceo.shares.zrok.io/download/bootstrap-install.ps1' -OutFile '%TEMP%\bootstrap-install.ps1' -UseBasicParsing"
+powershell -Command "Invoke-WebRequest -Uri 'https://your-relay.example.com/download/bootstrap-install.ps1' -OutFile '%TEMP%\bootstrap-install.ps1' -UseBasicParsing"
 echo [3] Esecuzione bootstrap...
 powershell -ExecutionPolicy Bypass -File "%TEMP%\bootstrap-install.ps1" -AgentId "!AGENT_ID!"
 goto :done

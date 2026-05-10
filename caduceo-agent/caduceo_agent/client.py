@@ -939,7 +939,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Caduceo Agent - Remote AI Access")
-    parser.add_argument("--relay", default="", help="URL del relay (es. wss://caduceo.shares.zrok.io)")
+    parser.add_argument("--relay", default="", help="URL del relay (es. wss://your-relay.example.com)")
     parser.add_argument("--psk", default=None, help="Pre-shared key hex (sconsigliato: usa --config, CADUCEO_PSK env, o ~/.caduceo/agent.psk)")
     parser.add_argument("--agent-id", default="", help="Agent ID (auto-generato se vuoto)")
     parser.add_argument("--tags", default="", help="Tag separati da virgola")

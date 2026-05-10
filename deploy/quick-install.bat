@@ -7,15 +7,15 @@ REM Parameter: %1 = AGENT_ID (optional)
 
 setlocal enabledelayedexpansion
 
-set RELAY_URL=wss://caduceo.shares.zrok.io
-set PSK=3d97d8ee4e6de4c452351fb2e4d2252a44dce8aef3fa3db5e4de2ce2402a4b05
+set RELAY_URL=wss://your-relay.example.com
+set PSK=CHANGE_ME_GENERATE_A_NEW_PSK
 set PLATFORM=windows
 
 if "%~1"=="" (
     echo === Caduceo Agent Quick Install ===
     echo.
     echo Scaricamento installer...
-    powershell -Command "Invoke-WebRequest -Uri 'https://caduceo.shares.zrok.io/download/install.py?platform=%PLATFORM%' -OutFile '%TEMP%\caduceo-install.py'"
+    powershell -Command "Invoke-WebRequest -Uri 'https://your-relay.example.com/download/install.py?platform=%PLATFORM%' -OutFile '%TEMP%\caduceo-install.py'"
     echo.
     echo Esecuzione installer interattivo...
     python %TEMP%\caduceo-install.py
@@ -30,7 +30,7 @@ if "%~1"=="" (
     echo {"relay_url": "%RELAY_URL%", "psk_hex": "%PSK%", "agent_id": "!AGENT_ID!", "tags": "caduceo"} > "%USERPROFILE%\.caduceo\agent.json"
     
     echo Scaricamento installer...
-    powershell -Command "Invoke-WebRequest -Uri 'https://caduceo.shares.zrok.io/download/install.py?platform=%PLATFORM%' -OutFile '%TEMP%\caduceo-install.py'"
+    powershell -Command "Invoke-WebRequest -Uri 'https://your-relay.example.com/download/install.py?platform=%PLATFORM%' -OutFile '%TEMP%\caduceo-install.py'"
     echo.
     echo Esecuzione installer con --config...
     python %TEMP%\caduceo-install.py

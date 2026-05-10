@@ -27,7 +27,7 @@ echo.
 
 REM Download the PowerShell installer
 echo [1] Scaricamento installer...
-powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://caduceo.shares.zrok.io/download/caduceo-setup.ps1' -OutFile '%TEMP%\caduceo-setup.ps1' -UseBasicParsing"
+powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://your-relay.example.com/download/caduceo-setup.ps1' -OutFile '%TEMP%\caduceo-setup.ps1' -UseBasicParsing"
 
 if not exist "%TEMP%\caduceo-setup.ps1" (
     echo ERRORE: Download fallito. Controlla la connessione internet.

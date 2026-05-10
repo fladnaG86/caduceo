@@ -101,7 +101,7 @@ class RelayConfig:
             "relay_ws_url": f"ws://127.0.0.1:{self.port}",
             "jwt_secret": self.jwt_secret,
             "psk_hex": self.psk_hex,
-            "note": "JWT token can be generated from jwt_secret. For production use WSS and HTTPS on caduceo.shares.zrok.io",
+            "note": "JWT token can be generated from jwt_secret. For production, use WSS and HTTPS",
         }
         creds_path.write_text(json.dumps(data, indent=2))
         os.chmod(creds_path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600

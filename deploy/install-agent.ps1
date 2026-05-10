@@ -18,7 +18,7 @@ PSK per autenticazione (opzionale, se non specificato usa default)
 .\install-agent.ps1 -AgentId ufficio -Tags "caduceo,office"
 
 One-liner (run from CMD or PowerShell):
-  powershell -Command "& { $f=\"$env:TEMP\install-agent.ps1\"; Invoke-WebRequest 'https://caduceo.shares.zrok.io/download/install-agent.ps1' -OutFile $f -UseBasicParsing; & $f -AgentId vmcardpresso }"
+  powershell -Command "& { $f=\"$env:TEMP\install-agent.ps1\"; Invoke-WebRequest 'https://your-relay.example.com/download/install-agent.ps1' -OutFile $f -UseBasicParsing; & $f -AgentId vmcardpresso }"
 #>
 
 param(
@@ -68,10 +68,10 @@ function Invoke-NativeSafe {
 # ============================================================
 #  CONFIGURATION
 # ============================================================
-$RelayUrl  = "wss://caduceo.shares.zrok.io"
+$RelayUrl  = "wss://your-relay.example.com"
 # Use PSK from parameter if provided, otherwise use default (for backwards compatibility)
 if ($PskHex -eq "") {
-    $PskHex = "3d97d8ee4e6de4c452351fb2e4d2252a44dce8aef3fa3db5e4de2ce2402a4b05"
+    $PskHex = "CHANGE_ME_GENERATE_A_NEW_PSK"
 }
 $PythonUrl = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip"
 $GetPipUrl = "https://bootstrap.pypa.io/get-pip.py"
@@ -344,9 +344,9 @@ if ($useVenv) {
     $installPy = Join-Path $env:TEMP "caduceo-install.py"
     Add-TempFile -Path $installPy
     try {
-        Invoke-WebRequest -Uri "https://caduceo.shares.zrok.io/download/install.py?platform=windows" -OutFile $installPy -UseBasicParsing
+        Invoke-WebRequest -Uri "https://your-relay.example.com/download/install.py?platform=windows" -OutFile $installPy -UseBasicParsing
     } catch {
-        $dlExit = Invoke-NativeSafe { curl.exe -sL -o $installPy "https://caduceo.shares.zrok.io/download/install.py?platform=windows" }
+        $dlExit = Invoke-NativeSafe { curl.exe -sL -o $installPy "https://your-relay.example.com/download/install.py?platform=windows" }
         # Verify file exists and has content after curl
         if (-not (Test-Path $installPy) -or (Get-Item $installPy).Length -eq 0) {
             Write-Err "ERRORE: Impossibile scaricare install.py"
@@ -383,9 +383,9 @@ if ($useVenv) {
     $instPy = Join-Path $env:TEMP "caduceo-install.py"
     Add-TempFile -Path $instPy
     try {
-        Invoke-WebRequest -Uri "https://caduceo.shares.zrok.io/download/install.py?platform=windows" -OutFile $instPy -UseBasicParsing
+        Invoke-WebRequest -Uri "https://your-relay.example.com/download/install.py?platform=windows" -OutFile $instPy -UseBasicParsing
     } catch {
-        $dlExit = Invoke-NativeSafe { curl.exe -sL -o $instPy "https://caduceo.shares.zrok.io/download/install.py?platform=windows" }
+        $dlExit = Invoke-NativeSafe { curl.exe -sL -o $instPy "https://your-relay.example.com/download/install.py?platform=windows" }
         # Verify file exists and has content after curl
         if (-not (Test-Path $instPy) -or (Get-Item $instPy).Length -eq 0) {
             Write-Err "ERRORE: Impossibile scaricare i pacchetti caduceo."

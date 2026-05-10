@@ -1,5 +1,5 @@
 [Unit]
-Description=Zrok Public Share for Caduceo Relay (reserved: caduceo.shares.zrok.io)
+Description=Zrok Public Share for Caduceo Relay (reserved: your-relay.example.com)
 After=network-online.target
 Wants=network-online.target
 

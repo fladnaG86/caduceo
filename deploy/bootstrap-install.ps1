@@ -23,8 +23,8 @@ $CaduceoDir = Join-Path $env:USERPROFILE ".caduceo"
 $EmbedDir = Join-Path $CaduceoDir "python"
 $EmbedExe = Join-Path $EmbedDir "python.exe"
 $EmbedPip = Join-Path $EmbedDir "Scripts\pip.exe"
-$RelayUrl = "wss://caduceo.shares.zrok.io"
-$PskHex = "3d97d8ee4e6de4c452351fb2e4d2252a44dce8aef3fa3db5e4de2ce2402a4b05"
+$RelayUrl = "wss://your-relay.example.com"
+$PskHex = "CHANGE_ME_GENERATE_A_NEW_PSK"
 $PythonUrl = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip"
 $GetPipUrl = "https://bootstrap.pypa.io/get-pip.py"
 
@@ -177,7 +177,7 @@ if ($useVenv) {
     # System Python: use install.py which creates venv
     Write-Status "[3/6] Scaricamento install.py..."
     $installPy = Join-Path $env:TEMP "caduceo-install.py"
-    Invoke-WebRequest -Uri "https://caduceo.shares.zrok.io/download/install.py?platform=windows" -OutFile $installPy -UseBasicParsing
+    Invoke-WebRequest -Uri "https://your-relay.example.com/download/install.py?platform=windows" -OutFile $installPy -UseBasicParsing
     Write-OK "       install.py scaricato"
     
     Write-Status "[4/6] Esecuzione install.py con venv..."
@@ -206,8 +206,8 @@ if ($useVenv) {
     $agentWhl = Join-Path $CaduceoDir "caduceo_agent-0.1.0-py3-none-any.whl"
     
     # Download wheels from relay
-    Invoke-WebRequest -Uri "https://caduceo.shares.zrok.io/download/caduceo_common-0.1.0-py3-none-any.whl" -OutFile $commonWhl -UseBasicParsing -ErrorAction SilentlyContinue
-    Invoke-WebRequest -Uri "https://caduceo.shares.zrok.io/download/caduceo_agent-0.1.0-py3-none-any.whl" -OutFile $agentWhl -UseBasicParsing -ErrorAction SilentlyContinue
+    Invoke-WebRequest -Uri "https://your-relay.example.com/download/caduceo_common-0.1.0-py3-none-any.whl" -OutFile $commonWhl -UseBasicParsing -ErrorAction SilentlyContinue
+    Invoke-WebRequest -Uri "https://your-relay.example.com/download/caduceo_agent-0.1.0-py3-none-any.whl" -OutFile $agentWhl -UseBasicParsing -ErrorAction SilentlyContinue
     
     if ((Test-Path $commonWhl) -and (Test-Path $agentWhl)) {
         & $usePython -m pip install --force-reinstall $commonWhl $agentWhl --quiet 2>&1 | ForEach-Object { Write-Host "       $_" }
@@ -218,9 +218,9 @@ if ($useVenv) {
         Write-Host "       Wheel non disponibili via download. Estrazione da install.py..."
         $instPy = Join-Path $env:TEMP "caduceo-install.py"
         try {
-            Invoke-WebRequest -Uri "https://caduceo.shares.zrok.io/download/install.py?platform=windows" -OutFile $instPy -UseBasicParsing
+            Invoke-WebRequest -Uri "https://your-relay.example.com/download/install.py?platform=windows" -OutFile $instPy -UseBasicParsing
         } catch {
-            & curl.exe -sL -o $instPy "https://caduceo.shares.zrok.io/download/install.py?platform=windows"
+            & curl.exe -sL -o $instPy "https://your-relay.example.com/download/install.py?platform=windows"
         }
         
         # Extract wheel data from install.py and create wheels

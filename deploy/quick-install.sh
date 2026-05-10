@@ -1,6 +1,6 @@
 #!/bin/bash
 # Caduceo Agent - Quick Install (Linux/macOS)
-# Usage: curl -sSL https://caduceo.shares.zrok.io/download/install.py?platform=linux | python3 -
+# Usage: curl -sSL https://your-relay.example.com/download/install.py?platform=linux | python3 -
 # Or:   python3 quick-install.sh
 # 
 # Non-interactive: pass AGENT_ID and TAGS as environment variables
@@ -10,9 +10,9 @@ set -e
 
 AGENT_ID="${AGENT_ID:-}"
 TAGS="${TAGS:-caduceo}"
-RELAY_URL="wss://caduceo.shares.zrok.io"
+RELAY_URL="wss://your-relay.example.com"
 PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
-INSTALLER_URL="https://caduceo.shares.zrok.io/download/install.py?platform=${PLATFORM}"
+INSTALLER_URL="https://your-relay.example.com/download/install.py?platform=${PLATFORM}"
 
 echo "=== Caduceo Agent Quick Install ==="
 echo "Platform: $PLATFORM"
@@ -29,7 +29,7 @@ if [ -n "$AGENT_ID" ]; then
     cat > ~/.caduceo/agent.json << EOF
 {
     "relay_url": "$RELAY_URL",
-    "psk_hex": "3d97d8ee4e6de4c452351fb2e4d2252a44dce8aef3fa3db5e4de2ce2402a4b05",
+    "psk_hex": "CHANGE_ME_GENERATE_A_NEW_PSK",
     "agent_id": "$AGENT_ID",
     "tags": "$TAGS"
 }

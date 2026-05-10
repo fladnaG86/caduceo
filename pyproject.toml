@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "Hermes Agent", email = "ermes_agent_maulan@zohomail.eu" }
+    { name = "Hermes Agent", email = "caduceo@example.com" }
 ]
 keywords = ["remote-access", "ai-agent", "shell", "relay", "hermes"]
 classifiers = [

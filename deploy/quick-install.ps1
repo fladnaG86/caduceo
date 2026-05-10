@@ -4,16 +4,16 @@
 #   Non-interattivo: .\quick-install.ps1 -AgentId "mio-pc"
 #
 #scarica & esegui in un colpo solo (da PowerShell):
-#  Invoke-Expression (Invoke-WebRequest -Uri "https://caduceo.shares.zrok.io/download/quick-install.ps1").Content
+#  Invoke-Expression (Invoke-WebRequest -Uri "https://your-relay.example.com/download/quick-install.ps1").Content
 
 param(
     [string]$AgentId = "",
     [string]$Tags = "caduceo"
 )
 
-$RelayUrl = "wss://caduceo.shares.zrok.io"
-$PskHex = "3d97d8ee4e6de4c452351fb2e4d2252a44dce8aef3fa3db5e4de2ce2402a4b05"
-$InstallerUrl = "https://caduceo.shares.zrok.io/download/install.py?platform=windows"
+$RelayUrl = "wss://your-relay.example.com"
+$PskHex = "CHANGE_ME_GENERATE_A_NEW_PSK"
+$InstallerUrl = "https://your-relay.example.com/download/install.py?platform=windows"
 $CaduceoDir = Join-Path $env:USERPROFILE ".caduceo"
 $InstallerPath = Join-Path $env:TEMP "caduceo-install.py"
 

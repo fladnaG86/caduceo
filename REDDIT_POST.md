@@ -109,7 +109,7 @@ POST /api/agents/WIN-FOR-ACCESS/command
 
 # Upload a file to a remote machine
 POST /api/agents/O-MASSIMO/upload
-{"destination": "C:\\Users\\mlanterna\\Desktop\\report.pdf", "content": "<base64>"}
+{"destination": "C:\\Users\\user\\Desktop\\report.pdf", "content": "<base64>"}
 ```
 
 From my AI assistant's perspective, it's just another API. From the machines' perspective, it's a tiny background process that phones home over WebSocket.

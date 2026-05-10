@@ -709,14 +709,14 @@ class TestAuditLog:
         await audit._get_db()
 
         await audit.log("command", "agent-test", subject="ls -la",
-                        detail="args=[] timeout=30", source_ip="192.168.1.5")
+                        detail="args=[] timeout=30", source_ip="10.0.0.50")
 
         records = await audit.query(agent_id="agent-test")
         assert len(records) == 1
         assert records[0]["action"] == "command"
         assert records[0]["agent_id"] == "agent-test"
         assert records[0]["subject"] == "ls -la"
-        assert records[0]["source_ip"] == "192.168.1.5"
+        assert records[0]["source_ip"] == "10.0.0.50"
 
         await audit.close()
 
