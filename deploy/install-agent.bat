@@ -5,7 +5,7 @@ REM   Funziona CON o SENZA Python installato
 REM   Gestisce automaticamente lo stub del Windows Store
 REM
 REM   Uso:  install-agent.bat [AGENT_ID]
-REM   Es:   install-agent.bat vmcardpresso
+REM   Es:   install-agent.bat my-pc
 REM         install-agent.bat ufficio
 REM ============================================================
 

@@ -14,11 +14,11 @@ Comma-separated tags (default: "caduceo")
 PSK per autenticazione (opzionale, se non specificato usa default)
 
 .EXAMPLE
-.\install-agent.ps1 -AgentId vmcardpresso
+.\install-agent.ps1 -AgentId my-pc
 .\install-agent.ps1 -AgentId ufficio -Tags "caduceo,office"
 
 One-liner (run from CMD or PowerShell):
-  powershell -Command "& { $f=\"$env:TEMP\install-agent.ps1\"; Invoke-WebRequest 'https://your-relay.example.com/download/install-agent.ps1' -OutFile $f -UseBasicParsing; & $f -AgentId vmcardpresso }"
+  powershell -Command "& { $f=\"$env:TEMP\install-agent.ps1\"; Invoke-WebRequest 'https://your-relay.example.com/download/install-agent.ps1' -OutFile $f -UseBasicParsing; & $f -AgentId my-pc }"
 #>
 
 param(

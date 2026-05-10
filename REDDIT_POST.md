@@ -100,15 +100,15 @@ My AI agent (Hermes) now has full access to my machines:
 
 ```python
 # Check system info on my work PC
-POST /api/agents/O-MASSIMO/command
+POST /api/agents/MY-PC-01/command
 {"command": "systeminfo | findstr OS", "timeout": 15}
 
 # Install software remotely
-POST /api/agents/WIN-FOR-ACCESS/command  
+POST /api/agents/MY-PC-02/command  
 {"command": "winget install VLC.VLC", "timeout": 60}
 
 # Upload a file to a remote machine
-POST /api/agents/O-MASSIMO/upload
+POST /api/agents/MY-PC-01/upload
 {"destination": "C:\\Users\\user\\Desktop\\report.pdf", "content": "<base64>"}
 ```
 
