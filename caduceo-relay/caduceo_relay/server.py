@@ -670,6 +670,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 raw = await ws.receive_text()
                 # Decritta il messaggio se crittografato
                 msg_data = json.loads(raw)
+                logger.debug(f"WS received msg keys: {list(msg_data.keys())}, has_nonce={'nonce_b64' in msg_data}, has_ct={'ciphertext_b64' in msg_data}")
                 # Se il messaggio ha nonce_b64 + ciphertext_b64, decritta
                 if "nonce_b64" in msg_data and "ciphertext_b64" in msg_data:
                     try:
@@ -677,14 +678,32 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                         aad = None
                         if "aad_b64" in msg_data:
                             aad = base64.b64decode(msg_data["aad_b64"])
+                            logger.debug(f"Decrypting msg from agent: aad_b64 present, aad={aad}")
+                        else:
+                            logger.debug(f"Decrypting msg from agent: no aad_b64, decrypting without AAD")
                         plaintext = crypto.decrypt(
                             msg_data["nonce_b64"],
                             msg_data["ciphertext_b64"],
                             aad=aad,
                         )
                         msg_data = json.loads(plaintext)
+                        logger.info(f"Decryption OK: msg_type={msg_data.get('type','?')}, keys={list(msg_data.keys())}")
+                        logger.debug(f"Decrypted msg data: {json.dumps(msg_data, default=str)[:500]}")
                     except Exception as e:
-                        logger.error(f"Decryption fallita: {e}")
+                        logger.error(f"Decryption fallita: {type(e).__name__}: {e}")
+                        logger.debug(f"  msg keys: {list(msg_data.keys())}")
+                        logger.debug(f"  nonce_b64 len={len(msg_data.get('nonce_b64',''))}, ct_b64 len={len(msg_data.get('ciphertext_b64',''))}")
+                        # Try without AAD to diagnose
+                        try:
+                            plaintext_no_aad = crypto.decrypt(
+                                msg_data["nonce_b64"],
+                                msg_data["ciphertext_b64"],
+                                aad=None,
+                            )
+                            msg_data = json.loads(plaintext_no_aad)
+                            logger.warning(f"Decryption works WITHOUT AAD - AAD mismatch! msg_type={msg_data.get('type','?')}")
+                        except Exception as e2:
+                            logger.error(f"Decryption without AAD also failed: {type(e2).__name__}: {e2}")
                         continue
 
                 msg = parse_message(msg_data)
@@ -710,10 +729,14 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
                 elif msg.type in (MessageType.FILE_RESPONSE, MessageType.SCREENSHOT_RESPONSE, MessageType.INFO_RESPONSE):
                     request_id = msg.request_id
+                    logger.info(f"Received {msg.type} for request {request_id}: path={getattr(msg, 'path', 'N/A')}, size={getattr(msg, 'size', 'N/A')}, keys={list(msg.__dict__.keys()) if hasattr(msg, '__dict__') else '?'}")
                     async with registry._lock:
                         future = registry.pending_responses.pop(request_id, None)
                     if future and not future.done():
+                        logger.info(f"Resolved future for {request_id}")
                         future.set_result(msg)
+                    else:
+                        logger.warning(f"No pending future for {msg.type} request_id={request_id}, future={future}, done={future.done() if future else 'N/A'}")
 
                 else:
                     logger.debug(f"Messaggio non gestito da {msg.agent_id}: {msg.type}")
@@ -777,8 +800,11 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
         try:
             # Crittografa il messaggio prima di inviarlo
-            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.COMMAND, request_id))
-            await agent.websocket.send_json(encrypted)
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.COMMAND, request_id))
+                await agent.websocket.send_json(encrypted)
+            else:
+                await agent.websocket.send_json(message)
             response = await asyncio.wait_for(future, timeout=cmd.timeout)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
@@ -808,8 +834,11 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "request_id": request_id,
                 "path": req.path,
             }
-            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.FILE_DOWNLOAD, request_id))
-            await agent.websocket.send_json(encrypted)
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.FILE_DOWNLOAD, request_id))
+                await agent.websocket.send_json(encrypted)
+            else:
+                await agent.websocket.send_json(message)
             response = await asyncio.wait_for(future, timeout=60)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
@@ -843,8 +872,13 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "content_b64": req.content_b64,
                 "overwrite": req.overwrite,
             }
-            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.FILE_UPLOAD, request_id))
-            await agent.websocket.send_json(encrypted)
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.FILE_UPLOAD, request_id))
+                logger.debug(f"Sending FILE_UPLOAD encrypted to {agent_id}")
+                await agent.websocket.send_json(encrypted)
+            else:
+                logger.debug(f"Sending FILE_UPLOAD plaintext to {agent_id}: keys={list(message.keys())}, content_b64_len={len(message.get('content_b64',''))}")
+                await agent.websocket.send_json(message)
             response = await asyncio.wait_for(future, timeout=60)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
@@ -873,8 +907,11 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "type": MessageType.SCREENSHOT,
                 "request_id": request_id,
             }
-            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.SCREENSHOT, request_id))
-            await agent.websocket.send_json(encrypted)
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.SCREENSHOT, request_id))
+                await agent.websocket.send_json(encrypted)
+            else:
+                await agent.websocket.send_json(message)
             response = await asyncio.wait_for(future, timeout=30)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:
@@ -901,8 +938,11 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "type": MessageType.INFO,
                 "request_id": request_id,
             }
-            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.INFO, request_id))
-            await agent.websocket.send_json(encrypted)
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.INFO, request_id))
+                await agent.websocket.send_json(encrypted)
+            else:
+                await agent.websocket.send_json(message)
             response = await asyncio.wait_for(future, timeout=15)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
         except asyncio.TimeoutError:

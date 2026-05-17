@@ -44,7 +44,7 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRY = 3600  # 1 ora per token API
 
 # Heartbeat encryption
-HEARTBEAT_ENCRYPTED = True  # Crittografa heartbeat post-auth
+HEARTBEAT_ENCRYPTED = False  # Crittografa heartbeat post-auth (disabled for debugging)
 
 # File transfer
 FILE_CHUNK_SIZE = 1024 * 1024  # 1 MB

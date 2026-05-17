@@ -51,10 +51,12 @@ logger = logging.getLogger("caduceo.agent")
 
 # Directory consentite per operazioni file (path traversal protection)
 # Se vuoto, usa home utente come default (~)
-# Configurabile via env: CADUCEO_ALLOWED_PATHS=/home/user:/var/log:/tmp
+# Configurabile via env: CADUCEO_ALLOWED_PATHS=/home/user:/var/log:/tmp (su Windows usare ;)
 _DEFAULT_ALLOWED = os.path.expanduser("~")
 _raw_paths = os.environ.get("CADUCEO_ALLOWED_PATHS", "")
-ALLOWED_PATHS = _raw_paths.split(":") if _raw_paths else [_DEFAULT_ALLOWED]
+# Su Windows il ; e' il separatore naturale (perche' : e' nelle lettere disco C:\)
+_SEP = ";" if os.name == "nt" else ":"
+ALLOWED_PATHS = [p.strip() for p in _raw_paths.split(_SEP) if p.strip()] if _raw_paths else [_DEFAULT_ALLOWED]
 
 # Path che non possono MAI essere letti/sovrascritti, anche dentro ALLOWED_PATHS
 # Protezione defense-in-depth contro accesso a credenziali e configurazioni sensibili
@@ -680,8 +682,8 @@ class CaduceoAgent:
     # ── Helpers per invio messaggi crittografati ─────────────────────────
 
     async def _send_response(self, ws, response: dict):
-        """Invia una risposta al relay, crittografandola se il crypto e' disponibile."""
-        if self.crypto:
+        """Invia una risposta al relay, crittografandola se HEARTBEAT_ENCRYPTED e' abilitato."""
+        if HEARTBEAT_ENCRYPTED and self.crypto:
             msg_type = response.get("type", "")
             request_id = response.get("request_id", "")
             aad = f"{msg_type}:{request_id}".encode("utf-8")
