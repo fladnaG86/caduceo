@@ -8,7 +8,7 @@ echo.
 echo Avvio installazione in corso...
 echo.
 
-powershell -ExecutionPolicy Bypass -NoProfile -Command "Set-ExecutionPolicy Bypass -Scope Process -Force; &= '%~dp0install-agent-windows.ps1'"
+powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0install-agent-windows.ps1"
 
 echo.
 echo.
