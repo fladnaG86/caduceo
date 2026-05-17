@@ -87,7 +87,7 @@ if (Test-Path $zrokPath) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $archiveFile -UseBasicParsing -UserAgent 'Mozilla/5.0'
+        Invoke-WebRequest -Uri $url -OutFile $archiveFile -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
         $extractDir = Join-Path $env:TEMP 'zrok-extract'
         if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
         New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
