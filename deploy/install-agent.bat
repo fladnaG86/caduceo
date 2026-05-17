@@ -11,6 +11,10 @@ REM ============================================================
 
 setlocal enabledelayedexpansion
 set AGENT_ID=%~1
+REM ============================================================
+REM   CONFIGURA: Cambia RELAY_URL e PSK prima di distribuire
+REM ============================================================
+set RELAY_URL=wss://your-relay.example.com
 
 if "!AGENT_ID!"=="" (
     set AGENT_ID=%COMPUTERNAME%
@@ -25,7 +29,7 @@ echo   Agent ID: !AGENT_ID!
 echo.
 echo Scaricamento script di installazione...
 
-powershell -Command "Invoke-WebRequest -Uri 'https://533q08lvroip.shares.zrok.io/download/install-agent.ps1' -OutFile '%TEMP%\install-agent.ps1' -UseBasicParsing"
+powershell -Command "Invoke-WebRequest -Uri 'https://your-relay.example.com/download/install-agent.ps1' -OutFile '%TEMP%\install-agent.ps1' -UseBasicParsing"
 
 echo Esecuzione installazione...
 echo.
