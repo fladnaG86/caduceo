@@ -105,18 +105,22 @@ if (Test-Path $zrokPath) {
 
         # Now extract tar
         tar xf $tarFile -C $extractDir 2>$null
-        if (-not (Test-Path (Join-Path $extractDir 'zrok.exe'))) {
-            # zrok might be in a subdirectory
-            $zrokExe = Get-ChildItem -Path $extractDir -Filter 'zrok.exe' -Recurse | Select-Object -First 1
+        # zrok v2 ships as zrok2.exe
+        $zrokExeSrc = Join-Path $extractDir 'zrok2.exe'
+        if (-not (Test-Path $zrokExeSrc)) {
+            # check subdirectory or old name zrok.exe
+            $zrokExe = Get-ChildItem -Path $extractDir -Filter 'zrok2.exe' -Recurse | Select-Object -First 1
+            if (-not $zrokExe) {
+                $zrokExe = Get-ChildItem -Path $extractDir -Filter 'zrok.exe' -Recurse | Select-Object -First 1
+            }
             if ($zrokExe) {
-                Copy-Item $zrokExe.FullName $zrokPath -Force
+                $zrokExeSrc = $zrokExe.FullName
             } else {
-                Write-Err 'zrok.exe non trovato nell archivio'
+                Write-Err 'zrok2.exe non trovato nell archivio'
                 exit 1
             }
-        } else {
-            Copy-Item (Join-Path $extractDir 'zrok.exe') $zrokPath -Force
         }
+        Copy-Item $zrokExeSrc $zrokPath -Force
         Remove-Item $archiveFile -Force
         Remove-Item $tarFile -Force
         Remove-Item $extractDir -Recurse -Force
