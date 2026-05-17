@@ -595,7 +595,27 @@ class CaduceoAgent:
                         )
                         msg_data = json.loads(plaintext)
                     except Exception as e:
-                        logger.error(f"Decryption fallita: {e}")
+                        logger.error(f"Decryption fallita: {type(e).__name__}: {e}")
+                        logger.debug(f"  Message keys: {list(msg_data.keys())}")
+                        logger.debug(f"  nonce_b64 len: {len(msg_data.get('nonce_b64', ''))}")
+                        logger.debug(f"  ciphertext_b64 len: {len(msg_data.get('ciphertext_b64', ''))}")
+                        aad_present = 'aad_b64' in msg_data
+                        logger.debug(f"  aad_b64 present: {aad_present}")
+                        if aad_present:
+                            logger.debug(f"  aad_b64 len: {len(msg_data.get('aad_b64', ''))}")
+                            # Try without AAD to diagnose AAD mismatch
+                            try:
+                                if self.crypto is not None:
+                                    plaintext_no_aad = self.crypto.decrypt(
+                                        msg_data["nonce_b64"],
+                                        msg_data["ciphertext_b64"],
+                                        aad=None,
+                                    )
+                                    logger.warning("  Decryption works WITHOUT AAD - AAD mismatch issue!")
+                                    msg_data = json.loads(plaintext_no_aad)
+                                    continue
+                            except Exception as e2:
+                                logger.debug(f"  Decryption without AAD also failed: {type(e2).__name__}: {e2}")
                         continue
 
                 msg_type = msg_data.get("type", "")

@@ -696,6 +696,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                     ack_msg = {"type": MessageType.HEARTBEAT_ACK, "timestamp": int(time.time())}
                     if HEARTBEAT_ENCRYPTED and crypto:
                         encrypted_ack = crypto.encrypt_message(ack_msg, aad=make_aad(MessageType.HEARTBEAT_ACK))
+                        logger.debug(f"Sending encrypted heartbeat_ack: keys={list(encrypted_ack.keys())}, nonce_len={len(encrypted_ack.get('nonce_b64',''))}, ct_len={len(encrypted_ack.get('ciphertext_b64',''))}, aad_len={len(encrypted_ack.get('aad_b64','')) if 'aad_b64' in encrypted_ack else 0}")
                         await ws.send_json(encrypted_ack)
                     else:
                         await ws.send_json(ack_msg)
