@@ -80,17 +80,46 @@ if (Test-Path $zrokPath) {
     $zrokDir = Split-Path $zrokPath
     New-Item -ItemType Directory -Force -Path $zrokDir | Out-Null
 
-    $url = 'https://github.com/openziti/zrok/releases/download/v2.0.3/zrok_2.0.3_windows_amd64.zip'
-    $zip = Join-Path $env:TEMP 'zrok.zip'
+    $url = 'https://github.com/openziti/zrok/releases/download/v2.0.3/zrok_2.0.3_windows_amd64.tar.gz'
+    $archiveExt = '.tar.gz'
+    $archiveFile = Join-Path $env:TEMP 'zrok.tar.gz'
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-        Expand-Archive -Path $zip -DestinationPath (Join-Path $env:TEMP 'zrok-extract') -Force
-        Copy-Item (Join-Path $env:TEMP 'zrok-extract\zrok.exe') $zrokPath -Force
-        Remove-Item $zip -Force
-        Remove-Item (Join-Path $env:TEMP 'zrok-extract') -Recurse -Force
+        Invoke-WebRequest -Uri $url -OutFile $archiveFile -UseBasicParsing
+        $extractDir = Join-Path $env:TEMP 'zrok-extract'
+        if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+        # Extract .tar.gz: first gunzip, then tar extract
+        $gzFile = $archiveFile
+        $tarFile = $archiveFile -replace '\.gz$', ''
+        $stream = [System.IO.File]::OpenRead($gzFile)
+        $decompress = New-Object System.IO.Compression.GZipStream($stream, [System.IO.Compression.CompressionMode]::Decompress)
+        $outStream = [System.IO.File]::Create($tarFile)
+        $decompress.CopyTo($outStream)
+        $outStream.Close()
+        $decompress.Close()
+        $stream.Close()
+
+        # Now extract tar
+        tar xf $tarFile -C $extractDir 2>$null
+        if (-not (Test-Path (Join-Path $extractDir 'zrok.exe'))) {
+            # zrok might be in a subdirectory
+            $zrokExe = Get-ChildItem -Path $extractDir -Filter 'zrok.exe' -Recurse | Select-Object -First 1
+            if ($zrokExe) {
+                Copy-Item $zrokExe.FullName $zrokPath -Force
+            } else {
+                Write-Err 'zrok.exe non trovato nell archivio'
+                exit 1
+            }
+        } else {
+            Copy-Item (Join-Path $extractDir 'zrok.exe') $zrokPath -Force
+        }
+        Remove-Item $archiveFile -Force
+        Remove-Item $tarFile -Force
+        Remove-Item $extractDir -Recurse -Force
     } catch {
         Write-Err "Download zrok fallito: $_"
         Write-Warn 'Scarica manualmente da https://github.com/openziti/zrok/releases'
