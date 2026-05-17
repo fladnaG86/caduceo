@@ -531,6 +531,15 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(404, "caduceo-setup.bat non trovato")
         return FileResponse(path, filename="caduceo-setup.bat", media_type="text/plain")
 
+    @app.get("/download/caduceo-agent.zip")
+    async def download_agent_zip():
+        """Download the complete Windows agent package (ZIP). Public, no auth required."""
+        import glob
+        candidates = list(DEPLOY_DIR.glob("caduceo-agent*.zip"))
+        if not candidates:
+            raise HTTPException(404, "caduceo-agent.zip non trovato")
+        return FileResponse(candidates[-1], filename="caduceo-agent-windows.zip", media_type="application/zip")
+
     @app.get("/download/caduceo_common.whl")
     async def download_common_whl():
         """Download caduceo-common wheel. Public, no auth required."""

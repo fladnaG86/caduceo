@@ -26,8 +26,10 @@ relay.json
 agent.json
 credentials.json
 
-# Deploy wheels (regenerated from source)
+# Deploy wheels and packages (regenerated from source)
 deploy/*.whl
+deploy/*.zip
+deploy/caduceo-agent-windows/
 
 # Logs
 *.log
