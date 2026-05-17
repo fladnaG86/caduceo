@@ -1,6 +1,7 @@
 """Caduceo Relay - Server principale con FastAPI + WebSocket."""
 
 import asyncio
+import base64
 import hashlib
 import hmac as hmac_mod
 import json
@@ -27,6 +28,7 @@ from caduceo_common.constants import (
     JWT_EXPIRY,
     AUTH_NONCE_LENGTH,
     HEARTBEAT_ENCRYPTED,
+    WS_MAX_SIZE,
     MessageType,
 )
 from caduceo_common.crypto import Crypto
@@ -127,9 +129,16 @@ class FileUploadRequest(BaseModel):
 class ScreenshotRequest(BaseModel):
     pass
 
+ALLOWED_ROLES = {"admin", "viewer"}
+
 class TokenRequest(BaseModel):
     subject: str = "hermes"
     role: str = "admin"
+
+    def validate_role(self):
+        if self.role not in ALLOWED_ROLES:
+            raise ValueError(f"Role '{self.role}' non valido. Ruoli permessi: {', '.join(sorted(ALLOWED_ROLES))}")
+        return self
 
 
 # ── Registry Agent ──────────────────────────────────────────────────────────
@@ -407,6 +416,10 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
     audit = AuditLog(config.db_path.parent / "audit.db")
     crypto = config.crypto
 
+    def make_aad(message_type: str, request_id: str = "") -> bytes:
+        """Genera AAD (Additional Authenticated Data) per legare il ciphertext al tipo messaggio."""
+        return f"{message_type}:{request_id}".encode("utf-8")
+
     # Inizializza DB all'avvio
     @app.on_event("startup")
     async def startup():
@@ -559,7 +572,18 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         except jwt.InvalidTokenError:
             raise HTTPException(401, "Token non valido")
 
+    def verify_role(*allowed_roles: str):
+        """Dependency che verifica il ruolo nel JWT token. Es: Depends(verify_role("admin"))"""
+        def _check(user: dict = Depends(verify_token)):
+            user_role = user.get("role", "")
+            if user_role not in allowed_roles:
+                raise HTTPException(403, f"Ruolo '{user_role}' non autorizzato. Richiesto: {', '.join(allowed_roles)}")
+            return user
+        return _check
+
     # ── WebSocket: Agent ─────────────────────────────────────────────────
+
+    WS_MSG_MAX_SIZE = WS_MAX_SIZE  # Limite dimensione messaggi WebSocket
 
     @app.websocket(WS_AGENT_PATH)
     async def agent_endpoint(ws: WebSocket):
@@ -640,9 +664,14 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 # Se il messaggio ha nonce_b64 + ciphertext_b64, decritta
                 if "nonce_b64" in msg_data and "ciphertext_b64" in msg_data:
                     try:
+                        # Estrae AAD per verificare integrita' contestuale
+                        aad = None
+                        if "aad_b64" in msg_data:
+                            aad = base64.b64decode(msg_data["aad_b64"])
                         plaintext = crypto.decrypt(
                             msg_data["nonce_b64"],
                             msg_data["ciphertext_b64"],
+                            aad=aad,
                         )
                         msg_data = json.loads(plaintext)
                     except Exception as e:
@@ -657,7 +686,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                     # Crittografa la risposta heartbeat_ack
                     ack_msg = {"type": MessageType.HEARTBEAT_ACK, "timestamp": int(time.time())}
                     if HEARTBEAT_ENCRYPTED and crypto:
-                        encrypted_ack = crypto.encrypt_message(ack_msg)
+                        encrypted_ack = crypto.encrypt_message(ack_msg, aad=make_aad(MessageType.HEARTBEAT_ACK))
                         await ws.send_json(encrypted_ack)
                     else:
                         await ws.send_json(ack_msg)
@@ -706,7 +735,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         return agent.to_dict()
 
     @app.post("/api/agents/{agent_id}/command")
-    async def send_command(agent_id: str, cmd: CommandRequest, user: dict = Depends(verify_token), request: Request = None):
+    async def send_command(agent_id: str, cmd: CommandRequest, user: dict = Depends(verify_role("admin")), request: Request = None):
         """Invia un comando a un agent."""
         source_ip = request.client.host if request and request.client else ""
         await audit.log("command", agent_id, subject=cmd.command,
@@ -738,7 +767,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
         try:
             # Crittografa il messaggio prima di inviarlo
-            encrypted = crypto.encrypt_message(message)
+            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.COMMAND, request_id))
             await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=cmd.timeout)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
@@ -748,7 +777,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(504, f"Timeout comando su {agent_id}")
 
     @app.post("/api/agents/{agent_id}/file/download")
-    async def download_file(agent_id: str, req: FileDownloadRequest, user: dict = Depends(verify_token), request: Request = None):
+    async def download_file(agent_id: str, req: FileDownloadRequest, user: dict = Depends(verify_role("admin")), request: Request = None):
         """Richiedi download di un file dall'agent."""
         source_ip = request.client.host if request and request.client else ""
         await audit.log("file_download", agent_id, subject=req.path, source_ip=source_ip)
@@ -769,7 +798,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "request_id": request_id,
                 "path": req.path,
             }
-            encrypted = crypto.encrypt_message(message)
+            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.FILE_DOWNLOAD, request_id))
             await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=60)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
@@ -779,7 +808,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(504, f"Timeout download file da {agent_id}")
 
     @app.post("/api/agents/{agent_id}/file/upload")
-    async def upload_file(agent_id: str, req: FileUploadRequest, user: dict = Depends(verify_token), request: Request = None):
+    async def upload_file(agent_id: str, req: FileUploadRequest, user: dict = Depends(verify_role("admin")), request: Request = None):
         """Upload di un file verso l'agent."""
         source_ip = request.client.host if request and request.client else ""
         await audit.log("file_upload", agent_id, subject=req.path,
@@ -804,7 +833,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "content_b64": req.content_b64,
                 "overwrite": req.overwrite,
             }
-            encrypted = crypto.encrypt_message(message)
+            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.FILE_UPLOAD, request_id))
             await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=60)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
@@ -814,7 +843,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             raise HTTPException(504, f"Timeout upload file su {agent_id}")
 
     @app.post("/api/agents/{agent_id}/screenshot")
-    async def take_screenshot(agent_id: str, user: dict = Depends(verify_token), request: Request = None):
+    async def take_screenshot(agent_id: str, user: dict = Depends(verify_role("admin")), request: Request = None):
         """Richiedi screenshot dall'agent."""
         source_ip = request.client.host if request and request.client else ""
         await audit.log("screenshot", agent_id, source_ip=source_ip)
@@ -834,7 +863,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "type": MessageType.SCREENSHOT,
                 "request_id": request_id,
             }
-            encrypted = crypto.encrypt_message(message)
+            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.SCREENSHOT, request_id))
             await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=30)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
@@ -862,7 +891,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 "type": MessageType.INFO,
                 "request_id": request_id,
             }
-            encrypted = crypto.encrypt_message(message)
+            encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.INFO, request_id))
             await agent.websocket.send_json(encrypted)
             response = await asyncio.wait_for(future, timeout=15)
             return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
@@ -898,6 +927,12 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         Accessibile SOLO da localhost per bootstrap.
         In produzione, usare il CLI tool o la credentials file.
         """
+        # Valida il role richiesto
+        try:
+            req.validate_role()
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
         # Verifica che la richiesta arrivi da localhost
         if request:
             client_host = request.client.host if request.client else "unknown"

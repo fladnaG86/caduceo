@@ -50,6 +50,9 @@ HEARTBEAT_ENCRYPTED = True  # Crittografa heartbeat post-auth
 FILE_CHUNK_SIZE = 1024 * 1024  # 1 MB
 FILE_MAX_SIZE = 50 * 1024 * 1024  # 50 MB max per singolo file
 
+# WebSocket message size limit (prevents OOM from oversized messages)
+WS_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
+
 # Screenshot
 SCREENSHOT_FORMAT = "png"
 SCREENSHOT_QUALITY = 85  # per JPEG, se usato

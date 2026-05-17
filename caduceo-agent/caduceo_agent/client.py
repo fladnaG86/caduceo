@@ -27,6 +27,8 @@ from caduceo_common.constants import (
     PROTOCOL_VERSION,
     WS_AGENT_PATH,
     COMMAND_TIMEOUT_DEFAULT,
+    COMMAND_TIMEOUT_MAX,
+    WS_MAX_SIZE,
     FILE_CHUNK_SIZE,
     SCREENSHOT_FORMAT,
     HEARTBEAT_ENCRYPTED,
@@ -123,7 +125,9 @@ def validate_path(path_str: str) -> Path:
 # ── Shell Executor ──────────────────────────────────────────────────────────
 
 class ShellExecutor:
-    """Esegue comandi shell su qualsiasi OS."""
+    """Esegue comandi shell in modo asincrono."""
+
+    ALLOWED_SHELLS = {"bash", "sh", "zsh", "powershell", "cmd", "powershell.exe", "cmd.exe"}
 
     @staticmethod
     def detect_shell() -> str:
@@ -142,6 +146,12 @@ class ShellExecutor:
                       shell: str = "") -> dict:
         """Esegue un comando shell e restituisce stdout, stderr, exit_code."""
         shell = shell or ShellExecutor.detect_shell()
+
+        # Valida che la shell sia nella allowlist
+        shell_base = shell.lower().replace("\\", "/").split("/")[-1]
+        if shell_base not in ShellExecutor.ALLOWED_SHELLS:
+            logger.warning(f"Shell non permessa '{shell}' - fallback a {ShellExecutor.detect_shell()}")
+            shell = ShellExecutor.detect_shell()
 
         # Costruisci il comando completo in modo sicuro
         # Su Windows: usare doppioni apici (stile cmd.exe) per gli argomenti
@@ -492,6 +502,7 @@ class CaduceoAgent:
                     ws_url,
                     ping_interval=HEARTBEAT_INTERVAL,
                     ping_timeout=10,
+                    max_size=WS_MAX_SIZE,
                 ) as ws:
                     self.ws = ws
 
@@ -573,9 +584,14 @@ class CaduceoAgent:
                 # Decritta se il messaggio e' crittografato
                 if "nonce_b64" in msg_data and "ciphertext_b64" in msg_data:
                     try:
+                        # Estrae AAD dal messaggio se presente per legare il ciphertext al contesto
+                        aad = None
+                        if "aad_b64" in msg_data:
+                            aad = base64.b64decode(msg_data["aad_b64"])
                         plaintext = self.crypto.decrypt(
                             msg_data["nonce_b64"],
                             msg_data["ciphertext_b64"],
+                            aad=aad,
                         )
                         msg_data = json.loads(plaintext)
                     except Exception as e:
@@ -629,7 +645,8 @@ class CaduceoAgent:
                 }
                 # Crittografa l'heartbeat se crypto e' disponibile
                 if self.crypto and HEARTBEAT_ENCRYPTED:
-                    encrypted = self.crypto.encrypt_message(heartbeat)
+                    aad = f"{MessageType.HEARTBEAT}:{self.agent_id}".encode("utf-8")
+                    encrypted = self.crypto.encrypt_message(heartbeat, aad=aad)
                     await ws.send(json.dumps(encrypted))
                 else:
                     await ws.send(json.dumps(heartbeat))
@@ -645,7 +662,10 @@ class CaduceoAgent:
     async def _send_response(self, ws, response: dict):
         """Invia una risposta al relay, crittografandola se il crypto e' disponibile."""
         if self.crypto:
-            encrypted = self.crypto.encrypt_message(response)
+            msg_type = response.get("type", "")
+            request_id = response.get("request_id", "")
+            aad = f"{msg_type}:{request_id}".encode("utf-8")
+            encrypted = self.crypto.encrypt_message(response, aad=aad)
             await ws.send(json.dumps(encrypted))
         else:
             await ws.send(json.dumps(response))
@@ -657,7 +677,7 @@ class CaduceoAgent:
         request_id = msg.get("request_id", "")
         command = msg.get("command", "")
         args = msg.get("args", [])
-        timeout = msg.get("timeout", COMMAND_TIMEOUT_DEFAULT)
+        timeout = min(msg.get("timeout", COMMAND_TIMEOUT_DEFAULT), COMMAND_TIMEOUT_MAX)
         shell = msg.get("shell", "")
 
         logger.info(f"Esecuzione comando: {command} {' '.join(args) if args else ''}")

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from .constants import MessageType
+from .constants import MessageType, PROTOCOL_VERSION
 from .utils import generate_request_id, detect_os
 
 
@@ -13,6 +13,7 @@ from .utils import generate_request_id, detect_os
 class Message:
     """Messaggio base del protocollo Caduceo."""
     type: str
+    version: str = PROTOCOL_VERSION
     timestamp: int = 0
     request_id: str = ""
 
@@ -147,10 +148,32 @@ class InfoResponse(Message):
     network: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class AuthChallengeMessage(Message):
+    """Challenge nonce inviato dal relay per autenticazione PSK."""
+    type: str = MessageType.AUTH_CHALLENGE
+    nonce: str = ""
+
+
+@dataclass
+class HeartbeatAckMessage(Message):
+    """Ack del heartbeat inviato dal relay all'agent."""
+    type: str = MessageType.HEARTBEAT_ACK
+
+
+@dataclass
+class PingMessage(Message):
+    """Ping dal relay per verificare connessione agent."""
+    type: str = MessageType.PING
+
+
 # Mappa tipo messaggio → classe
 MESSAGE_TYPES: dict[str, type] = {
     MessageType.REGISTER: RegisterMessage,
     MessageType.HEARTBEAT: HeartbeatMessage,
+    MessageType.AUTH_CHALLENGE: AuthChallengeMessage,
+    MessageType.HEARTBEAT_ACK: HeartbeatAckMessage,
+    MessageType.PING: PingMessage,
     MessageType.COMMAND: CommandMessage,
     MessageType.COMMAND_RESPONSE: CommandResponse,
     MessageType.FILE_DOWNLOAD: FileDownloadMessage,
@@ -165,7 +188,13 @@ MESSAGE_TYPES: dict[str, type] = {
 
 
 def parse_message(data: dict) -> Message:
-    """Deserializza un dizionario nel tipo di messaggio corretto."""
+    """Deserializza un dizionario nel tipo di messaggio corretto. Rifiuta versioni non compatibili."""
+    msg_version = data.get("version", "")
+    if msg_version and msg_version != PROTOCOL_VERSION:
+        from .constants import PROTOCOL_VERSION as PV
+        raise ValueError(
+            f"Versione protocollo non compatibile: ricevuto {msg_version}, atteso {PV}"
+        )
     msg_type = data.get("type", "")
     msg_class = MESSAGE_TYPES.get(msg_type, Message)
     known_fields = {f for f in msg_class.__dataclass_fields__}
