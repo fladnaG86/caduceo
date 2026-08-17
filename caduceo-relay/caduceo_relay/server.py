@@ -1055,7 +1055,25 @@ def main():
     print(f"{'='*60}\n")
 
     app = create_app(config)
-    uvicorn.run(app, host=config.host, port=config.port)
+
+    # Explicit WebSocket + server config for reliable WS handshakes.
+    # - ws="websockets": force the websockets library (not wsproto) for WS upgrades
+    # - ws_max_size: match protocol WS_MAX_SIZE (10 MB) so large messages don't get rejected
+    # - ws_ping_interval/ws_ping_timeout: keep idle WS connections alive through proxies/NAT
+    # - timeout_keep_alive=0: disable HTTP keep-alive timeout that can close idle TCP
+    #   connections before the WS upgrade completes on slow networks
+    # - proxy_headers=True: trust X-Forwarded-* headers (Tailscale, reverse proxies)
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        ws="websockets",
+        ws_max_size=WS_MAX_SIZE,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
+        timeout_keep_alive=0,
+        proxy_headers=True,
+    )
 
 
 if __name__ == "__main__":

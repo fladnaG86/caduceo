@@ -500,12 +500,23 @@ class CaduceoAgent:
                 logger.info(f"Connessione a {self.relay_url}...")
                 ws_url = f"{self.relay_url}{WS_AGENT_PATH}"
 
-                async with websockets.connect(
-                    ws_url,
+                # Build connect kwargs; proxy=None bypasses system/HTTP proxies
+                # (websockets>=15 defaults proxy=True, which routes WS handshakes
+                # through corporate proxies on Windows → "did not receive a valid
+                # HTTP response" / EOF). Guard for older versions without the param.
+                _ws_kwargs = dict(
                     ping_interval=HEARTBEAT_INTERVAL,
                     ping_timeout=10,
                     max_size=WS_MAX_SIZE,
-                ) as ws:
+                )
+                try:
+                    import inspect as _inspect
+                    if "proxy" in _inspect.signature(websockets.connect).parameters:
+                        _ws_kwargs["proxy"] = None
+                except Exception:
+                    pass
+
+                async with websockets.connect(ws_url, **_ws_kwargs) as ws:
                     self.ws = ws
 
                     # Fase 1: ricevi challenge nonce dal server
