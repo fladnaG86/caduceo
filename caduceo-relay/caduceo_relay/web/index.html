@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Caduceo — Console di Gestione</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <!-- ═══ Sidebar di navigazione ═══ -->
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-icon">🩺</div>
+      <div class="brand-text">
+        <strong>Caduceo</strong>
+        <span>Console di gestione</span>
+      </div>
+    </div>
+
+    <nav id="nav">
+      <button class="nav-item active" data-view="dashboard">📊 <span>Dashboard</span></button>
+      <button class="nav-item" data-view="agents">🖥️ <span>PC connessi</span></button>
+      <button class="nav-item" data-view="ai">🤖 <span>Assistente IA</span></button>
+      <button class="nav-item" data-view="audit">🧾 <span>Registro attività</span></button>
+    </nav>
+
+    <div id="sidebar-footer">
+      <div id="conn-status" class="status-dot" title="Stato connessione"></div>
+      <span id="conn-label">Non connesso</span>
+    </div>
+  </aside>
+
+  <!-- ═══ Area principale ═══ -->
+  <main id="main">
+    <!-- Barra utente (in alto, visibile quando autenticato) -->
+    <div id="user-bar" class="hidden">
+      <div id="user-info">
+        <span class="user-label">Loggato come</span>
+        <strong id="user-name">—</strong>
+      </div>
+      <button id="logout-btn" class="secondary">Esci</button>
+    </div>
+
+    <!-- Schermata di login -->
+    <div id="login-screen">
+      <div class="login-card">
+        <div class="login-icon">🩺</div>
+        <h1>Caduceo</h1>
+        <p class="login-sub">Console di gestione degli agenti remoti</p>
+        <button id="oidc-btn" class="primary">Accedi con Authentik</button>
+        <p class="login-hint">Accedi tramite il provider Authentik.</p>
+        <div class="login-fallback">
+          <p class="login-hint">Fallback: inserisci il token JWT fornito dall'amministratore del relay.</p>
+          <input type="password" id="token-input" placeholder="Inserisci il tuo token di accesso" autocomplete="off">
+          <button id="token-btn" class="secondary">Accedi con token</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Contenitore delle viste (popolato dal router) -->
+    <div id="view" class="hidden"></div>
+  </main>
+
+  <div id="toast" class="hidden"></div>
+
+  <!-- Script: helper di base PRIMA dei moduli -->
+  <script src="/web/app.js"></script>
+  <script src="/web/dashboard.js"></script>
+  <script src="/web/terminal.js"></script>
+  <script src="/web/audit.js"></script>
+  <script src="/web/files.js"></script>
+  <script src="/web/remote.js"></script>
+  <script src="/web/ai.js"></script>
+</body>
+</html>

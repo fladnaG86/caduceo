@@ -11,13 +11,16 @@ import secrets
 import stat
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import jwt
 import aiosqlite
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
+
+from caduceo_relay.oidc_validator import OIDCConfig, OIDCValidator
 
 from caduceo_common.constants import (
     WS_AGENT_PATH,
@@ -45,6 +48,7 @@ class RelayConfig:
         self.port = 8443
         self.jwt_secret = ""
         self.psk_hex = ""
+        self.download_key = ""  # chiave per accedere ai /download (protegge il PSK pubblico)
         self.queue_ttl = QUEUE_TTL_DEFAULT
         self.db_path = Path.home() / ".caduceo" / "relay.db"
         self.config_path = Path.home() / ".caduceo" / "relay.json"
@@ -55,6 +59,8 @@ class RelayConfig:
             self.psk_hex = Crypto.generate_key_hex()
         if not self.jwt_secret:
             self.jwt_secret = secrets.token_hex(32)
+        if not self.download_key:
+            self.download_key = secrets.token_hex(16)  # chiave per proteggere i /download
         self.crypto = Crypto.from_hex(self.psk_hex)
 
     def save(self):
@@ -65,6 +71,7 @@ class RelayConfig:
             "port": self.port,
             "jwt_secret": self.jwt_secret,
             "psk_hex": self.psk_hex,
+            "download_key": self.download_key,
             "queue_ttl": self.queue_ttl,
         }
         self.config_path.write_text(json.dumps(data, indent=2))
@@ -129,6 +136,25 @@ class FileUploadRequest(BaseModel):
 class ScreenshotRequest(BaseModel):
     pass
 
+class InputEventRequest(BaseModel):
+    event_type: str
+    x: float = 0.0
+    y: float = 0.0
+    button: str = ""
+    scroll_delta: float = 0.0
+    key: str = ""
+    keys: str = ""
+    text: str = ""
+    duration: float = 0.0
+
+class StreamStartRequest(BaseModel):
+    fps: int = 0
+    quality: int = 0
+    scale_factor: float = 0.0
+
+class StreamStopRequest(BaseModel):
+    pass
+
 ALLOWED_ROLES = {"admin", "viewer"}
 
 class TokenRequest(BaseModel):
@@ -157,6 +183,8 @@ class AgentInfo:
         self.connected_at = time.time()
         self.last_heartbeat = time.time()
         self.stats: dict = {}
+        self.latest_frame: dict | None = None   # ultimo frame streaming (per MJPEG)
+        self.streaming: bool = False
 
     @property
     def is_online(self) -> bool:
@@ -416,6 +444,38 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
     audit = AuditLog(config.db_path.parent / "audit.db")
     crypto = config.crypto
 
+    # ── OIDC (Authentik) ─────────────────────────────────────────────────────
+    # OIDC è disattivato se issuer o client_id sono vuoti/placeholder. In
+    # produzione impostare OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_REDIRECT_URI.
+    oidc_cfg = OIDCConfig(
+        issuer=os.environ.get(
+            "OIDC_ISSUER",
+            "http://127.0.0.1:9000/application/o/caduceo/",
+        ),
+        client_id=os.environ.get(
+            "OIDC_CLIENT_ID",
+            "",  # sostituire con il client_id reale di Authentik
+        ),
+        redirect_uri=os.environ.get(
+            "OIDC_REDIRECT_URI",
+            "http://localhost:8442/api/auth/oidc/callback",
+        ),
+    )
+    oidc = OIDCValidator(oidc_cfg) if oidc_cfg.issuer and oidc_cfg.client_id else None
+    oidc_sessions: dict[str, dict[str, str]] = {}
+
+    def oidc_disabled() -> None:
+        if oidc is None:
+            raise HTTPException(501, "Login OIDC non configurato")
+
+    def oidc_error_redirect(redirect_after: str, message: str) -> RedirectResponse:
+        separator = "&" if "?" in redirect_after else "?"
+        return RedirectResponse(
+            url=f"{redirect_after}{separator}error={quote(message[:200])}",
+            status_code=302,
+        )
+
+
     def make_aad(message_type: str, request_id: str = "") -> bytes:
         """Genera AAD (Additional Authenticated Data) per legare il ciphertext al tipo messaggio."""
         return f"{message_type}:{request_id}".encode("utf-8")
@@ -435,11 +495,45 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
     # ── Public Download Endpoint ────────────────────────────────────────────
 
     INSTALLER_DIR = Path("/mnt/nas_hermes/Cartella Agent Hermes")
-    DEPLOY_DIR = Path("/home/manutenzione/caduceo/deploy")
+    # DEPLOY_DIR: usa la dir di produzione se presente (dbcoemi /opt/caduceo/deploy),
+    # altrimenti il default locale. Rende gli endpoint /download funzionanti su entrambi.
+    DEPLOY_DIR = Path("/opt/caduceo/deploy") if Path("/opt/caduceo/deploy").exists() \
+        else Path("/home/manutenzione/caduceo/deploy")
+    WEB_DIR = Path(__file__).resolve().parent / "web"
+
+    # ── Remote Control Web UI ───────────────────────────────────────────────
+
+    @app.get("/")
+    async def web_ui_root():
+        """Pagina principale di controllo remoto."""
+        return FileResponse(WEB_DIR / "index.html")
+
+    @app.get("/web/{filename}")
+    async def web_ui_file(filename: str):
+        """File statici della web UI (css, js)."""
+        from fastapi.responses import FileResponse as FR
+        # Protezione path traversal
+        safe = Path(filename).name
+        path = WEB_DIR / safe
+        if not path.exists():
+            raise HTTPException(404, "File non trovato")
+        return FR(path)
+
+    # ── Auth per download (protegge il PSK pubblico) ─────────────────────────
+
+    def verify_download(key: str = Query(default="")):
+        """Protegge gli endpoint /download/* con una chiave segreta.
+        Senza la chiave corretta, i file (che contengono il PSK) NON sono scaricabili."""
+        if not config.download_key:
+            # Nessuna chiave configurata → blocca comunque (default sicuro)
+            raise HTTPException(403, "Download protetto: chiave non configurata")
+        if key != config.download_key:
+            raise HTTPException(403, "Download protetti: chiave mancante o errata. Usa ?key=<download_key>")
+        return True
 
     @app.get("/download/install.py")
-    async def download_installer(platform: str = "windows"):
-        """Download the Caduceo Agent installer. Public, no auth required.
+    async def download_installer(platform: str = "windows", _auth: bool = Depends(verify_download)):
+        """Download the Caduceo Agent installer. Protected by download key.
         ?platform=windows|linux|macos"""
         platform = platform.lower()
         if platform not in ("windows", "linux", "macos"):
@@ -460,80 +554,80 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         )
 
     @app.get("/download/quick-install.ps1")
-    async def download_quick_install_ps1():
-        """Download the Windows PowerShell quick-install script. Public, no auth required."""
+    async def download_quick_install_ps1(_auth: bool = Depends(verify_download)):
+        """Download the Windows PowerShell quick-install script. Protected by download key."""
         path = DEPLOY_DIR / "quick-install.ps1"
         if not path.exists():
             raise HTTPException(404, "quick-install.ps1 non trovato")
         return FileResponse(path, filename="quick-install.ps1", media_type="text/plain")
 
     @app.get("/download/quick-install.bat")
-    async def download_quick_install_bat():
-        """Download the Windows batch quick-install script. Public, no auth required."""
+    async def download_quick_install_bat(_auth: bool = Depends(verify_download)):
+        """Download the Windows batch quick-install script. Protected by download key."""
         path = DEPLOY_DIR / "quick-install.bat"
         if not path.exists():
             raise HTTPException(404, "quick-install.bat non trovato")
         return FileResponse(path, filename="quick-install.bat", media_type="text/plain")
 
     @app.get("/download/quick-install.sh")
-    async def download_quick_install_sh():
-        """Download the Linux/macOS quick-install script. Public, no auth required."""
+    async def download_quick_install_sh(_auth: bool = Depends(verify_download)):
+        """Download the Linux/macOS quick-install script. Protected by download key."""
         path = DEPLOY_DIR / "quick-install.sh"
         if not path.exists():
             raise HTTPException(404, "quick-install.sh non trovato")
         return FileResponse(path, filename="quick-install.sh", media_type="text/x-shellscript")
 
     @app.get("/download/bootstrap-install.ps1")
-    async def download_bootstrap_ps1():
-        """Download the Windows bootstrap installer (works without Python). Public, no auth required."""
+    async def download_bootstrap_ps1(_auth: bool = Depends(verify_download)):
+        """Download the Windows bootstrap installer (works without Python). Protected by download key."""
         path = DEPLOY_DIR / "bootstrap-install.ps1"
         if not path.exists():
             raise HTTPException(404, "bootstrap-install.ps1 non trovato")
         return FileResponse(path, filename="bootstrap-install.ps1", media_type="text/plain")
 
     @app.get("/download/bootstrap-install.bat")
-    async def download_bootstrap_bat():
-        """Download the Windows bootstrap batch installer. Public, no auth required."""
+    async def download_bootstrap_bat(_auth: bool = Depends(verify_download)):
+        """Download the Windows bootstrap batch installer. Protected by download key."""
         path = DEPLOY_DIR / "bootstrap-install.bat"
         if not path.exists():
             raise HTTPException(404, "bootstrap-install.bat non trovato")
         return FileResponse(path, filename="bootstrap-install.bat", media_type="text/plain")
 
     @app.get("/download/install-agent.ps1")
-    async def download_install_agent_ps1():
-        """Download the unified Windows installer script. Public, no auth required."""
+    async def download_install_agent_ps1(_auth: bool = Depends(verify_download)):
+        """Download the unified Windows installer script. Protected by download key."""
         path = DEPLOY_DIR / "install-agent.ps1"
         if not path.exists():
             raise HTTPException(404, "install-agent.ps1 non trovato")
         return FileResponse(path, filename="install-agent.ps1", media_type="text/plain")
 
     @app.get("/download/install-agent.bat")
-    async def download_install_agent_bat():
-        """Download the unified Windows installer batch wrapper. Public, no auth required."""
+    async def download_install_agent_bat(_auth: bool = Depends(verify_download)):
+        """Download the unified Windows installer batch wrapper. Protected by download key."""
         path = DEPLOY_DIR / "install-agent.bat"
         if not path.exists():
             raise HTTPException(404, "install-agent.bat non trovato")
         return FileResponse(path, filename="install-agent.bat", media_type="text/plain")
 
     @app.get("/download/caduceo-setup.ps1")
-    async def download_caduceo_setup_ps1():
-        """Download the self-contained Windows installer PS1 (no Python needed). Public, no auth required."""
+    async def download_caduceo_setup_ps1(_auth: bool = Depends(verify_download)):
+        """Download the self-contained Windows installer PS1 (no Python needed). Protected by download key."""
         path = DEPLOY_DIR / "caduceo-setup.ps1"
         if not path.exists():
             raise HTTPException(404, "caduceo-setup.ps1 non trovato")
         return FileResponse(path, filename="caduceo-setup.ps1", media_type="text/plain")
 
     @app.get("/download/caduceo-setup.bat")
-    async def download_caduceo_setup_bat():
-        """Download the self-contained Windows installer BAT launcher. Public, no auth required."""
+    async def download_caduceo_setup_bat(_auth: bool = Depends(verify_download)):
+        """Download the self-contained Windows installer BAT launcher. Protected by download key."""
         path = DEPLOY_DIR / "caduceo-setup.bat"
         if not path.exists():
             raise HTTPException(404, "caduceo-setup.bat non trovato")
         return FileResponse(path, filename="caduceo-setup.bat", media_type="text/plain")
 
     @app.get("/download/caduceo-agent.zip")
-    async def download_agent_zip():
-        """Download the complete Windows agent package (ZIP). Public, no auth required."""
+    async def download_agent_zip(_auth: bool = Depends(verify_download)):
+        """Download the complete Windows agent package (ZIP). Protected by download key."""
         import glob
         candidates = list(DEPLOY_DIR.glob("caduceo-agent*.zip"))
         if not candidates:
@@ -541,8 +635,8 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         return FileResponse(candidates[-1], filename="caduceo-agent-windows.zip", media_type="application/zip")
 
     @app.get("/download/caduceo_common.whl")
-    async def download_common_whl():
-        """Download caduceo-common wheel. Public, no auth required."""
+    async def download_common_whl(_auth: bool = Depends(verify_download)):
+        """Download caduceo-common wheel. Protected by download key."""
         import glob
         # Try deploy dir first, then dist dirs
         candidates = list(DEPLOY_DIR.glob("caduceo_common*.whl"))
@@ -555,8 +649,8 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         return FileResponse(candidates[-1], filename="caduceo_common-0.1.0-py3-none-any.whl", media_type="application/octet-stream")
 
     @app.get("/download/caduceo_agent.whl")
-    async def download_agent_whl():
-        """Download caduceo-agent wheel. Public, no auth required."""
+    async def download_agent_whl(_auth: bool = Depends(verify_download)):
+        """Download caduceo-agent wheel. Protected by download key."""
         import glob
         candidates = list(DEPLOY_DIR.glob("caduceo_agent*.whl"))
         agent_dist = Path("/home/manutenzione/caduceo/caduceo-agent/dist")
@@ -568,13 +662,23 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
 
     # ── JWT Auth ─────────────────────────────────────────────────────────
 
-    def verify_token(authorization: str = Header(default="", alias="Authorization")) -> dict:
-        """Verifica JWT token per API Hermes."""
-        if not authorization.startswith("Bearer "):
+    def verify_token(authorization: str = Header(default="", alias="Authorization"), token: str = Query(default="")) -> dict:
+        """Verifica JWT token per API Hermes.
+
+        Supporta sia l'header Authorization ("Bearer <token>") sia un query param
+        `?token=<token>` (necessario per endpoint tipo MJPEG in <img> che non
+        possono inviare header personalizzati).
+        """
+        auth = authorization or ""
+        # Se manca l'header, usa il query param
+        if not auth.startswith("Bearer "):
+            if token:
+                auth = f"Bearer {token}"
+        if not auth.startswith("Bearer "):
             raise HTTPException(401, "Token mancante o formato errato. Usa: Bearer <token>")
-        token = authorization[7:]
+        token_val = auth[7:]
         try:
-            payload = jwt.decode(token, config.jwt_secret, algorithms=["HS256"])
+            payload = jwt.decode(token_val, config.jwt_secret, algorithms=["HS256"])
             return payload
         except jwt.ExpiredSignatureError:
             raise HTTPException(401, "Token scaduto")
@@ -737,6 +841,27 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                         future.set_result(msg)
                     else:
                         logger.warning(f"No pending future for {msg.type} request_id={request_id}, future={future}, done={future.done() if future else 'N/A'}")
+
+                elif msg.type == MessageType.STREAM_FRAME:
+                    # Frame continuo da streaming — aggiorna solo il buffer (no future)
+                    if agent_info:
+                        agent_info.latest_frame = {
+                            "content_b64": getattr(msg, "content_b64", ""),
+                            "width": getattr(msg, "width", 0),
+                            "height": getattr(msg, "height", 0),
+                            "format": getattr(msg, "format", "jpeg"),
+                            "frame_index": getattr(msg, "frame_index", 0),
+                            "timestamp": getattr(msg, "timestamp", int(time.time())),
+                        }
+
+                elif msg.type in (MessageType.INPUT_RESPONSE, MessageType.STREAM_RESPONSE):
+                    request_id = msg.request_id
+                    async with registry._lock:
+                        future = registry.pending_responses.pop(request_id, None)
+                    if future and not future.done():
+                        future.set_result(msg)
+                    if msg.type == MessageType.STREAM_RESPONSE and agent_info:
+                        agent_info.streaming = getattr(msg, "streaming", False)
 
                 else:
                     logger.debug(f"Messaggio non gestito da {msg.agent_id}: {msg.type}")
@@ -919,6 +1044,183 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
                 registry.pending_responses.pop(request_id, None)
             raise HTTPException(504, f"Timeout screenshot su {agent_id}")
 
+    @app.post("/api/agents/{agent_id}/input")
+    async def send_input(agent_id: str, req: InputEventRequest, user: dict = Depends(verify_role("admin")), request: Request = None):
+        """Invia un evento input (mouse/tastiera) all'agent."""
+        source_ip = request.client.host if request and request.client else ""
+        await audit.log("input", agent_id, subject=req.event_type, source_ip=source_ip)
+        agent = registry.get(agent_id)
+        if not agent:
+            raise HTTPException(404, f"Agent {agent_id} non trovato")
+        if not agent.is_online:
+            raise HTTPException(409, f"Agent {agent_id} offline")
+
+        request_id = f"req-{time.time_ns()}"
+        message = {
+            "type": MessageType.INPUT_EVENT,
+            "request_id": request_id,
+            "event_type": req.event_type,
+            "x": req.x,
+            "y": req.y,
+            "button": req.button,
+            "scroll_delta": req.scroll_delta,
+            "key": req.key,
+            "keys": req.keys,
+            "text": req.text,
+            "duration": req.duration,
+        }
+
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
+
+        try:
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.INPUT_EVENT, request_id))
+                await agent.websocket.send_json(encrypted)
+            else:
+                await agent.websocket.send_json(message)
+            response = await asyncio.wait_for(future, timeout=10)
+            return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
+        except asyncio.TimeoutError:
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
+            raise HTTPException(504, f"Timeout input su {agent_id}")
+        except Exception as e:
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
+            raise HTTPException(502, f"Errore invio input: {e}")
+
+    @app.post("/api/agents/{agent_id}/stream/start")
+    async def start_stream(agent_id: str, req: StreamStartRequest, user: dict = Depends(verify_role("admin")), request: Request = None):
+        """Avvia lo streaming remoto sull'agent."""
+        source_ip = request.client.host if request and request.client else ""
+        await audit.log("stream_start", agent_id, source_ip=source_ip)
+        agent = registry.get(agent_id)
+        if not agent:
+            raise HTTPException(404, f"Agent {agent_id} non trovato")
+        if not agent.is_online:
+            raise HTTPException(409, f"Agent {agent_id} offline")
+
+        request_id = f"req-{time.time_ns()}"
+        message = {
+            "type": MessageType.STREAM_START,
+            "request_id": request_id,
+            "fps": req.fps,
+            "quality": req.quality,
+            "scale_factor": req.scale_factor,
+        }
+
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
+
+        try:
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.STREAM_START, request_id))
+                await agent.websocket.send_json(encrypted)
+            else:
+                await agent.websocket.send_json(message)
+            response = await asyncio.wait_for(future, timeout=10)
+            agent.streaming = getattr(response, "streaming", False)
+            return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
+        except asyncio.TimeoutError:
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
+            raise HTTPException(504, f"Timeout start streaming su {agent_id}")
+        except Exception as e:
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
+            raise HTTPException(502, f"Errore start streaming: {e}")
+
+    @app.post("/api/agents/{agent_id}/stream/stop")
+    async def stop_stream(agent_id: str, req: StreamStopRequest = None, user: dict = Depends(verify_role("admin")), request: Request = None):
+        """Ferma lo streaming remoto sull'agent."""
+        source_ip = request.client.host if request and request.client else ""
+        await audit.log("stream_stop", agent_id, source_ip=source_ip)
+        agent = registry.get(agent_id)
+        if not agent:
+            raise HTTPException(404, f"Agent {agent_id} non trovato")
+        if not agent.is_online:
+            raise HTTPException(409, f"Agent {agent_id} offline")
+
+        request_id = f"req-{time.time_ns()}"
+        message = {
+            "type": MessageType.STREAM_STOP,
+            "request_id": request_id,
+        }
+
+        future = asyncio.get_running_loop().create_future()
+        async with registry._lock:
+            registry.pending_responses[request_id] = future
+
+        try:
+            if HEARTBEAT_ENCRYPTED:
+                encrypted = crypto.encrypt_message(message, aad=make_aad(MessageType.STREAM_STOP, request_id))
+                await agent.websocket.send_json(encrypted)
+            else:
+                await agent.websocket.send_json(message)
+            response = await asyncio.wait_for(future, timeout=10)
+            agent.streaming = getattr(response, "streaming", False)
+            return response.to_dict() if hasattr(response, "to_dict") else response.__dict__
+        except asyncio.TimeoutError:
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
+            raise HTTPException(504, f"Timeout stop streaming su {agent_id}")
+        except Exception as e:
+            async with registry._lock:
+                registry.pending_responses.pop(request_id, None)
+            raise HTTPException(502, f"Errore stop streaming: {e}")
+
+    @app.get("/api/agents/{agent_id}/stream.mjpeg")
+    async def stream_mjpeg(agent_id: str, user: dict = Depends(verify_token), request: Request = None):
+        """Streaming MJPEG multipart dei frame catturati dall'agent.
+
+        Il browser mostra questo endpoint direttamente in un <img>, senza JS.
+        Blocca finché ci sono frame, poi termina (auto-riconnessione del browser).
+        """
+        from fastapi.responses import StreamingResponse
+        agent = registry.get(agent_id)
+        if not agent:
+            raise HTTPException(404, f"Agent {agent_id} non trovato")
+
+        async def frame_generator():
+            last_index = -1
+            while True:
+                frame = agent.latest_frame
+                if frame and frame.get("frame_index", -1) > last_index:
+                    last_index = frame["frame_index"]
+                    content = base64.b64decode(frame.get("content_b64", ""))
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(content)).encode() + b"\r\n\r\n"
+                        + content + b"\r\n"
+                    )
+                else:
+                    await asyncio.sleep(0.1)
+
+        return StreamingResponse(
+            frame_generator(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/agents/{agent_id}/stream/meta")
+    async def stream_meta(agent_id: str, user: dict = Depends(verify_token)):
+        """Ritorna metadati dell'ultimo frame streaming (dimensioni, stato)."""
+        agent = registry.get(agent_id)
+        if not agent:
+            raise HTTPException(404, f"Agent {agent_id} non trovato")
+        f = agent.latest_frame
+        return {
+            "streaming": agent.streaming,
+            "width": f.get("width", 0) if f else 0,
+            "height": f.get("height", 0) if f else 0,
+            "frame_index": f.get("frame_index", -1) if f else -1,
+            "timestamp": f.get("timestamp", 0) if f else 0,
+        }
+
     @app.get("/api/agents/{agent_id}/info")
     async def get_info(agent_id: str, user: dict = Depends(verify_token)):
         """Richiedi info di sistema dall'agent."""
@@ -958,6 +1260,91 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         records = await audit.query(agent_id=agent_id, action=action, since=since, limit=min(limit, 500))
         return {"records": records, "count": len(records)}
 
+    # ── OIDC Login ───────────────────────────────────────────────────────────
+
+    @app.get("/api/auth/oidc/start")
+    async def oidc_start(redirect_after: str = "/"):
+        """Avvia Authorization Code + PKCE e redirige ad Authentik."""
+        oidc_disabled()
+        assert oidc is not None
+        state = secrets.token_urlsafe(32)
+        code_verifier = secrets.token_urlsafe(64)
+        oidc_sessions[state] = {
+            "verifier": code_verifier,
+            "redirect_after": redirect_after,
+        }
+        try:
+            authorization_url = oidc.authorization_url(state, code_verifier)
+        except Exception as exc:
+            oidc_sessions.pop(state, None)
+            logger.exception("OIDC discovery fallita")
+            return oidc_error_redirect(redirect_after, f"discovery_failed: {exc}")
+        return RedirectResponse(url=authorization_url, status_code=302)
+
+    @app.get("/api/auth/oidc/callback")
+    async def oidc_callback(code: str = "", state: str = ""):
+        """Scambia il code Authentik e crea il JWT HS256 interno del relay."""
+        oidc_disabled()
+        assert oidc is not None
+        session = oidc_sessions.pop(state, None)
+        redirect_after = session["redirect_after"] if session else "/"
+        if not session:
+            return oidc_error_redirect(redirect_after, "invalid_state")
+        if not code:
+            return oidc_error_redirect(redirect_after, "missing_code")
+
+        try:
+            tokens = oidc.exchange_code(code, session["verifier"])
+            # Authentik normalmente restituisce entrambi. Il validator verifica
+            # la firma RS256, issuer, audience e scadenza tramite le JWKS.
+            provider_token = tokens.get("access_token") or tokens.get("id_token")
+            if not provider_token:
+                raise ValueError("token OIDC mancante nella risposta")
+            claims = oidc.build_caduceo_claims(provider_token)
+            subject = claims.get("sub") or claims.get("username")
+            if not subject:
+                raise ValueError("subject OIDC mancante")
+            # Estrae username/email leggibili: prima da userinfo (affidabile),
+            # poi dall'id_token.
+            id_claims = {}
+            try:
+                id_claims = oidc.get_userinfo(tokens.get("access_token") or provider_token)
+            except Exception:
+                logger.warning("userinfo non disponibile, provo id_token", exc_info=True)
+                if tokens.get("id_token"):
+                    try:
+                        id_claims = oidc.decode_id_token(tokens["id_token"])
+                    except Exception:
+                        logger.warning("id_token firma non validata, decodifica loose", exc_info=True)
+                        id_claims = oidc.decode_id_token_loose(tokens["id_token"])
+            username = (
+                id_claims.get("preferred_username")
+                or id_claims.get("name")
+                or id_claims.get("username")
+                or claims.get("sub")
+                or subject
+            )
+            email = id_claims.get("email") or claims.get("email", "")
+            internal_token = jwt.encode(
+                {
+                    "sub": subject,
+                    "role": "admin",
+                    "username": username,
+                    "email": email,
+                    "exp": int(time.time()) + JWT_EXPIRY,
+                },
+                config.jwt_secret,
+                algorithm="HS256",
+            )
+            separator = "&" if "?" in redirect_after else "?"
+            return RedirectResponse(
+                url=f"{redirect_after}{separator}token={quote(internal_token)}",
+                status_code=302,
+            )
+        except Exception as exc:
+            logger.exception("Login OIDC fallito")
+            return oidc_error_redirect(redirect_after, f"authentication_failed: {exc}")
+
     @app.get("/api/health")
     async def health():
         """Health check (no auth required)."""
@@ -967,6 +1354,20 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
             "agents_online": len(registry.list_online()),
             "agents_total": len(registry.agents),
         }
+
+    # ── Download client (protetto da JWT) ────────────────────────────────
+    # Serve il pacchetto client (agent) scaricabile dalla dashboard.
+    # Usa l'autenticazione JWT dell'operatore (non la download_key pubblica).
+
+    CLIENT_ZIP = "caduceo-local.zip"
+
+    @app.get("/api/client/download")
+    async def client_download(user: dict = Depends(verify_token)):
+        """Scarica il pacchetto client da installare su altri PC. Richiede JWT."""
+        path = DEPLOY_DIR / CLIENT_ZIP
+        if not path.exists():
+            raise HTTPException(404, f"Pacchetto client non trovato: {CLIENT_ZIP}")
+        return FileResponse(path, filename=CLIENT_ZIP, media_type="application/zip")
 
     # ── Token: sola generazione da localhost ────────────────────────────
 

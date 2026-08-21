@@ -11,6 +11,7 @@ setup(
         "websockets>=12.0",
         "pyjwt>=2.8",
         "aiosqlite>=0.19",
+        "requests>=2.31",
     ],
     entry_points={
         "console_scripts": [
