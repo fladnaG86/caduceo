@@ -31,6 +31,11 @@ from caduceo_common.constants import (
     WS_MAX_SIZE,
     FILE_CHUNK_SIZE,
     SCREENSHOT_FORMAT,
+    STREAM_FPS,
+    STREAM_QUALITY,
+    STREAM_SCALE_FACTOR,
+    STREAM_MAX_FRAME_BYTES,
+    STREAM_IDLE_FRAMES,
     HEARTBEAT_ENCRYPTED,
     MessageType,
 )
@@ -421,6 +426,198 @@ class ScreenshotCapture:
         }
 
 
+# ── Input Controller (remote control) ───────────────────────────────────────
+
+class InputController:
+    """Inietta input mouse/tastiera nel sistema (remote control).
+
+    Backend: pyautogui se disponibile, altrimenti fallback su comandi di
+    sistema (xdotool su Linux, cliclick su macOS). Su Windows pyautogui usa
+    nativamente le API Win32, quindi è la scelta primaria.
+    """
+
+    def __init__(self):
+        self._pyautogui = None
+        self._backend = "none"
+        self._init_backend()
+
+    def _init_backend(self):
+        """Seleziona e inizializza il backend di input disponibile."""
+        # 1. Prova pyautogui (cross-platform: Windows nativo, X11 su Linux)
+        try:
+            import pyautogui
+            pyautogui.FAILSAFE = False  # disabilita il failsafe (edge corner)
+            pyautogui.PAUSE = 0.0       # niente pausa tra i comandi
+            self._pyautogui = pyautogui
+            self._backend = "pyautogui"
+            return
+        except Exception:
+            # pyautogui può fallire anche con ImportError, oppure con
+            # KeyError 'DISPLAY' su server headless senza X11, o altri errori
+            # di inizializzazione del backend grafico. Non deve MAI far
+            # crashare l'intero agent.
+            self._pyautogui = None
+
+        # 2. Linux: xdotool come fallback
+        if detect_os() == "linux":
+            try:
+                r = subprocess.run(
+                    ["which", "xdotool"], capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    self._backend = "xdotool"
+                    return
+            except Exception:
+                pass
+
+        # 3. macOS: cliclick come fallback
+        if detect_os() == "macos":
+            try:
+                r = subprocess.run(
+                    ["which", "cliclick"], capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    self._backend = "cliclick"
+                    return
+            except Exception:
+                pass
+
+        logger.warning("Nessun backend di input disponibile (installa pyautogui)")
+
+    @property
+    def available(self) -> bool:
+        return self._backend != "none"
+
+    def _screen_size(self):
+        if self._backend == "pyautogui":
+            w, h = self._pyautogui.size()
+            return w, h
+        return None
+
+    async def handle_event(self, event_type: str, data: dict) -> dict:
+        """Esegue un evento input. Ritorna {'success': bool, 'error': str}."""
+        try:
+            if not self.available:
+                return {"success": False, "error": "Backend input non disponibile (installa pyautogui)"}
+
+            if self._backend == "pyautogui":
+                return self._handle_pyautogui(event_type, data)
+            elif self._backend == "xdotool":
+                return self._handle_xdotool(event_type, data)
+            elif self._backend == "cliclick":
+                return self._handle_cliclick(event_type, data)
+
+            return {"success": False, "error": "Backend sconosciuto"}
+        except Exception as e:
+            logger.error(f"Errore input {event_type}: {e}")
+            return {"success": False, "error": str(e)}
+
+    # ── pyautogui backend ──────────────────────────────────────────────
+
+    def _handle_pyautogui(self, event_type: str, data: dict) -> dict:
+        pag = self._pyautogui
+        x = float(data.get("x", 0))
+        y = float(data.get("y", 0))
+        button = data.get("button", "left")
+        duration = float(data.get("duration", 0) or 0)
+
+        if event_type == "move":
+            pag.moveTo(x, y, duration=duration)
+        elif event_type == "down":
+            pag.mouseDown(x, y, button=button)
+        elif event_type == "up":
+            pag.mouseUp(x, y, button=button)
+        elif event_type == "click":
+            pag.click(x, y, button=button)
+        elif event_type == "scroll":
+            delta = float(data.get("scroll_delta", 0))
+            pag.scroll(int(delta))  # positivo = su, negativo = giù
+        elif event_type == "doubleclick":
+            pag.doubleClick(x, y, button=button)
+        elif event_type == "key_down":
+            pag.keyDown(data.get("key", ""))
+        elif event_type == "key_up":
+            pag.keyUp(data.get("key", ""))
+        elif event_type == "press":
+            pag.press(data.get("key", ""))
+        elif event_type == "hotkey":
+            keys = [k.strip() for k in data.get("keys", "").split("+") if k.strip()]
+            if keys:
+                pag.hotkey(*keys)
+        elif event_type == "text":
+            text = data.get("text", "")
+            if text:
+                pag.write(text)
+        else:
+            return {"success": False, "error": f"Evento sconosciuto: {event_type}"}
+
+        return {"success": True}
+
+    # ── xdotool backend (Linux fallback) ───────────────────────────────
+
+    def _run_xdotool(self, *args) -> dict:
+        try:
+            r = subprocess.run(
+                ["xdotool", *args], capture_output=True, text=True, timeout=5
+            )
+            if r.returncode != 0:
+                return {"success": False, "error": r.stderr.strip()}
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _handle_xdotool(self, event_type: str, data: dict) -> dict:
+        x = int(float(data.get("x", 0)))
+        y = int(float(data.get("y", 0)))
+        button_map = {"left": "1", "middle": "2", "right": "3"}
+
+        if event_type == "move":
+            return self._run_xdotool("mousemove", str(x), str(y))
+        elif event_type == "down":
+            btn = button_map.get(data.get("button", "left"), "1")
+            return self._run_xdotool("mousedown", btn)
+        elif event_type == "up":
+            btn = button_map.get(data.get("button", "left"), "1")
+            return self._run_xdotool("mouseup", btn)
+        elif event_type == "click":
+            btn = button_map.get(data.get("button", "left"), "1")
+            return self._run_xdotool("click", btn)
+        elif event_type == "scroll":
+            delta = int(float(data.get("scroll_delta", 0)))
+            direction = "4" if delta > 0 else "5"
+            return self._run_xdotool("click", direction)
+        elif event_type == "key_down":
+            return self._run_xdotool("keydown", data.get("key", ""))
+        elif event_type == "key_up":
+            return self._run_xdotool("keyup", data.get("key", ""))
+        elif event_type == "press":
+            return self._run_xdotool("key", data.get("key", ""))
+        elif event_type == "text":
+            return self._run_xdotool("type", "--delay", "5", data.get("text", ""))
+        else:
+            return {"success": False, "error": f"Evento sconosciuto: {event_type}"}
+
+    # ── cliclick backend (macOS fallback) ──────────────────────────────
+
+    def _handle_cliclick(self, event_type: str, data: dict) -> dict:
+        x = int(float(data.get("x", 0)))
+        y = int(float(data.get("y", 0)))
+        try:
+            if event_type == "move":
+                subprocess.run(["cliclick", f"m:{x},{y}"], timeout=5)
+            elif event_type == "click":
+                subprocess.run(["cliclick", f"c:{x},{y}"], timeout=5)
+            elif event_type == "down":
+                subprocess.run(["cliclick", f"dd:{x},{y}"], timeout=5)
+            elif event_type == "up":
+                subprocess.run(["cliclick", f"du:{x},{y}"], timeout=5)
+            else:
+                return {"success": False, "error": f"Evento non supportato: {event_type}"}
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
 # ── System Info ─────────────────────────────────────────────────────────────
 
 class SystemInfo:
@@ -429,12 +626,21 @@ class SystemInfo:
     @staticmethod
     def collect() -> dict:
         """Raccoglie informazioni complete sul sistema."""
-        boot_time = psutil.boot_time()
-        uptime = int(time.time() - boot_time)
+
+        def _safe(fn, default):
+            # Alcune piattaforme (iSH su iOS) espongono un /proc incompleto:
+            # un campo mancante non deve far fallire l'intera raccolta.
+            try:
+                return fn()
+            except Exception:
+                return default
+
+        boot_time = _safe(psutil.boot_time, 0) or 0
+        uptime = int(time.time() - boot_time) if boot_time else 0
 
         # Network info
         net_ifaces = {}
-        for name, addrs in psutil.net_if_addrs().items():
+        for name, addrs in _safe(psutil.net_if_addrs, {}).items():
             for addr in addrs:
                 if addr.family.name in ("AF_INET", "AF_INET6"):
                     iface = net_ifaces.setdefault(name, {"ipv4": [], "ipv6": []})
@@ -447,11 +653,11 @@ class SystemInfo:
             "os": detect_os(),
             "os_version": platform.version(),
             "arch": platform.machine(),
-            "cpu_count": psutil.cpu_count(),
-            "memory_total": psutil.virtual_memory().total,
-            "memory_percent": psutil.virtual_memory().percent,
-            "disk_total": psutil.disk_usage(disk_path).total,
-            "disk_percent": psutil.disk_usage(disk_path).percent,
+            "cpu_count": _safe(psutil.cpu_count, 0),
+            "memory_total": _safe(lambda: psutil.virtual_memory().total, 0),
+            "memory_percent": _safe(lambda: psutil.virtual_memory().percent, 0.0),
+            "disk_total": _safe(lambda: psutil.disk_usage(disk_path).total, 0),
+            "disk_percent": _safe(lambda: psutil.disk_usage(disk_path).percent, 0.0),
             "uptime_seconds": uptime,
             "network": net_ifaces,
         }
@@ -463,12 +669,13 @@ class CaduceoAgent:
     """Client Caduceo che gira sui PC remoti."""
 
     def __init__(self, relay_url: str, psk_hex: str, agent_id: str = "",
-                 tags: list[str] | None = None, token: str = ""):
+                 tags: list[str] | None = None, token: str = "", features: str = "full"):
         self.relay_url = relay_url
         self.psk_hex = psk_hex
         self.agent_id = agent_id or generate_agent_id()
         self.tags = tags or ["caduceo"]
         self.token = token
+        self.features = features  # "full" (remote desktop) o "base" (solo assistenza IA)
         self.crypto = Crypto.from_hex(psk_hex) if psk_hex else None
 
         self.ws = None
@@ -481,6 +688,10 @@ class CaduceoAgent:
         self.files = FileManager()
         self.screenshots = ScreenshotCapture()
         self.sysinfo = SystemInfo()
+        # Remote desktop (streaming + input) SOLO in modalità "full"
+        self.remote_enabled = (self.features == "full")
+        self.inputs = InputController() if self.remote_enabled else None
+        self._streaming_task = None
 
     def _generate_psk_challenge(self, nonce: str = "") -> str:
         """Genera la challenge PSK per l'autenticazione del WebSocket.
@@ -641,6 +852,12 @@ class CaduceoAgent:
                     await self._handle_file_upload(msg_data, ws)
                 elif msg_type == MessageType.SCREENSHOT:
                     await self._handle_screenshot(msg_data, ws)
+                elif msg_type == MessageType.INPUT_EVENT:
+                    await self._handle_input_event(msg_data, ws)
+                elif msg_type == MessageType.STREAM_START:
+                    await self._handle_stream_start(msg_data, ws)
+                elif msg_type == MessageType.STREAM_STOP:
+                    await self._handle_stream_stop(msg_data, ws)
                 elif msg_type == MessageType.INFO:
                     await self._handle_info(msg_data, ws)
                 elif msg_type == MessageType.PING:
@@ -665,11 +882,17 @@ class CaduceoAgent:
         """Invia heartbeat periodico al relay (cifrato se crypto disponibile)."""
         while True:
             try:
-                stats = {
-                    "cpu_percent": psutil.cpu_percent(),
-                    "memory_percent": psutil.virtual_memory().percent,
-                    "disk_percent": SystemInfo.collect().get("disk_percent", 0),
-                }
+                try:
+                    stats = {
+                        "cpu_percent": psutil.cpu_percent(),
+                        "memory_percent": psutil.virtual_memory().percent,
+                        "disk_percent": SystemInfo.collect().get("disk_percent", 0),
+                    }
+                except Exception as exc:
+                    # Piattaforme con /proc incompleto (es. iSH su iOS): psutil non riesce
+                    # a costruire scputimes, ma il heartbeat deve continuare ad andare.
+                    logger.warning(f"Statistiche non disponibili: {exc}")
+                    stats = {"cpu_percent": 0.0, "memory_percent": 0.0, "disk_percent": 0.0}
                 heartbeat = {
                     "type": MessageType.HEARTBEAT,
                     "agent_id": self.agent_id,
@@ -777,6 +1000,210 @@ class CaduceoAgent:
             **result,
         }
         await self._send_response(ws, response)
+
+    async def _handle_input_event(self, msg: dict, ws):
+        """Esegue un evento input (mouse/tastiera) e risponde con ack."""
+        request_id = msg.get("request_id", "")
+        event_type = msg.get("event_type", "")
+
+        # Remote desktop non abilitato in modalità "base"
+        if not self.remote_enabled or self.inputs is None:
+            response = {
+                "type": MessageType.INPUT_RESPONSE,
+                "request_id": request_id,
+                "agent_id": self.agent_id,
+                "success": False,
+                "error": "Funzioni remote desktop non abilitate in modalità base",
+            }
+            await self._send_response(ws, response)
+            return
+
+        logger.info(f"Evento input: {event_type}")
+        result = await self.inputs.handle_event(event_type, msg)
+
+        response = {
+            "type": MessageType.INPUT_RESPONSE,
+            "request_id": request_id,
+            "agent_id": self.agent_id,
+            "success": result.get("success", False),
+            "error": result.get("error", ""),
+        }
+        await self._send_response(ws, response)
+
+    async def _handle_stream_start(self, msg: dict, ws):
+        """Avvia il loop di streaming frame sull'agent."""
+        request_id = msg.get("request_id", "")
+
+        # Remote desktop solo in modalità "full"
+        if not self.remote_enabled:
+            response = {
+                "type": MessageType.STREAM_RESPONSE,
+                "request_id": request_id,
+                "agent_id": self.agent_id,
+                "streaming": False,
+                "error": "Streaming non abilitato in modalità base",
+            }
+            await self._send_response(ws, response)
+            return
+
+        # Se già in streaming, ferma il task precedente
+        if self._streaming_task and not self._streaming_task.done():
+            self._streaming_task.cancel()
+            try:
+                await self._streaming_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        fps = msg.get("fps") or STREAM_FPS
+        quality = msg.get("quality") or STREAM_QUALITY
+        scale_factor = msg.get("scale_factor") or STREAM_SCALE_FACTOR
+
+        # Avvia il loop di streaming
+        self._streaming_task = asyncio.create_task(
+            self._stream_loop(ws, fps, quality, scale_factor)
+        )
+
+        response = {
+            "type": MessageType.STREAM_RESPONSE,
+            "request_id": request_id,
+            "agent_id": self.agent_id,
+            "streaming": True,
+            "error": "",
+        }
+        await self._send_response(ws, response)
+
+    async def _handle_stream_stop(self, msg: dict, ws):
+        """Ferma il loop di streaming frame sull'agent."""
+        request_id = msg.get("request_id", "")
+
+        if self._streaming_task and not self._streaming_task.done():
+            self._streaming_task.cancel()
+            try:
+                await self._streaming_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._streaming_task = None
+
+        response = {
+            "type": MessageType.STREAM_RESPONSE,
+            "request_id": request_id,
+            "agent_id": self.agent_id,
+            "streaming": False,
+            "error": "",
+        }
+        await self._send_response(ws, response)
+
+    async def _stream_loop(self, ws, fps, quality, scale_factor):
+        """Cattura frame continui e li invia al relay finché non viene fermato.
+
+        Usa il backend più veloce disponibile (MSS per alta velocità, fallback
+        Pillow/pyautogui). Invia SEMPRE i frame al target FPS (anche se lo
+        schermo è statico) perché il video remoto deve restare "vivo" durante
+        il controllo. Salta i frame solo se la cattura è più lenta del target.
+        """
+        interval = 1.0 / max(1, int(fps or STREAM_FPS))
+        frame_index = 0
+
+        logger.info(f"Streaming avviato: {fps} fps, quality={quality}, scale={scale_factor}")
+
+        try:
+            while True:
+                started = time.monotonic()
+                try:
+                    frame = await self._capture_stream_frame(quality, scale_factor)
+                except Exception as e:
+                    logger.error(f"Errore cattura frame: {e}")
+                    await asyncio.sleep(interval)
+                    continue
+
+                if frame is not None:
+                    msg = {
+                        "type": MessageType.STREAM_FRAME,
+                        "agent_id": self.agent_id,
+                        "content_b64": frame["content_b64"],
+                        "width": frame.get("width", 0),
+                        "height": frame.get("height", 0),
+                        "format": "jpeg",
+                        "frame_index": frame_index,
+                        "timestamp": int(time.time()),
+                    }
+                    try:
+                        await self._send_response(ws, msg)
+                        frame_index += 1
+                    except websockets.ConnectionClosed:
+                        logger.warning("Connessione chiusa durante streaming")
+                        break
+                    except Exception as e:
+                        logger.error(f"Errore invio frame: {e}")
+                        break
+
+                # Rispetta il target FPS
+                elapsed = time.monotonic() - started
+                sleep = interval - elapsed
+                if sleep > 0:
+                    await asyncio.sleep(sleep)
+        except asyncio.CancelledError:
+            logger.info("Streaming fermato")
+            raise
+        except Exception as e:
+            logger.error(f"Loop streaming terminato: {e}")
+        finally:
+            self._streaming_task = None
+
+    async def _capture_stream_frame(self, quality, scale_factor):
+        """Cattura un frame JPEG compresso per lo streaming."""
+        from PIL import Image
+        import io
+
+        # 1. Prova MSS (veloce, cross-platform)
+        try:
+            import mss
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]  # primo schermo
+                sct_img = sct.grab(monitor)
+                img = Image.frombytes("RGB", sct_img.size, sct_img.rgb)
+        except ImportError:
+            img = None
+
+        if img is None:
+            # 2. Fallback su pyautogui
+            try:
+                import pyautogui
+                img = pyautogui.screenshot()
+            except ImportError:
+                pass
+
+        if img is None:
+            # 3. Fallback su ImageGrab (Windows)
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab()
+            except Exception:
+                pass
+
+        if img is None:
+            return None
+
+        # Scala se richiesto
+        if scale_factor and scale_factor != 1.0:
+            new_w = max(1, int(img.width * scale_factor))
+            new_h = max(1, int(img.height * scale_factor))
+            resample = getattr(Image, "Resampling", Image).LANCZOS
+            img = img.resize((new_w, new_h), resample)
+
+        # Converti a RGB (per JPEG) e comprimi
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=int(quality or STREAM_QUALITY))
+        content = buf.getvalue()
+        if len(content) > STREAM_MAX_FRAME_BYTES:
+            return None
+        return {
+            "content_b64": base64.b64encode(content).decode("ascii"),
+            "width": img.width,
+            "height": img.height,
+        }
 
     async def _handle_info(self, msg: dict, ws):
         """Raccoglie info di sistema e le invia al relay."""
@@ -1014,6 +1441,7 @@ def main():
     agent_id = args.agent_id
     tags_str = args.tags
     token = args.token
+    features = "full"  # default: remote desktop completo
 
     if args.config:
         config_path = os.path.expanduser(args.config)
@@ -1030,7 +1458,8 @@ def main():
                 tags_str = cfg.get("tags", "caduceo")
             if not token:
                 token = cfg.get("token", "")
-            logger.info(f"Config caricato da {config_path}")
+            features = cfg.get("features", "full")
+            logger.info(f"Config caricato da {config_path} (features={features})")
         else:
             logger.error(f"File config non trovato: {config_path}")
             sys.exit(1)
@@ -1065,6 +1494,7 @@ def main():
         agent_id=agent_id,
         tags=tags,
         token=token,
+        features=features,
     )
 
     try:
