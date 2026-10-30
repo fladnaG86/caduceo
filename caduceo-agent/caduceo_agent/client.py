@@ -198,36 +198,35 @@ class ShellExecutor:
                     "duration_ms": int((time.time() - start_time) * 1000),
                 }
             else:
-                # Linux/macOS: asyncio per non bloccare l'event loop
+                # Linux/macOS: subprocess.run in un thread separato.
+                # asyncio.create_subprocess_shell si BLOCCA (senza errore, senza timeout)
+                # su piattaforme con fork/posix_spawn parziale come iSH su iOS.
                 if shell == "powershell":
                     executable = shutil.which("pwsh") or "powershell"
                 elif shell == "zsh":
                     executable = "/bin/zsh"
                 elif shell == "bash":
-                    executable = "/bin/bash"
+                    executable = shutil.which("bash") or "/bin/bash"
                 else:
                     executable = None
 
-                proc = await asyncio.create_subprocess_shell(
+                result = await asyncio.to_thread(
+                    subprocess.run,
                     full_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    shell=True,
+                    capture_output=True,
+                    timeout=timeout,
                     executable=executable,
                 )
 
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
-                )
-
                 return {
-                    "exit_code": proc.returncode,
-                    "stdout": stdout.decode("utf-8", errors="replace"),
-                    "stderr": stderr.decode("utf-8", errors="replace"),
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout.decode("utf-8", errors="replace"),
+                    "stderr": result.stderr.decode("utf-8", errors="replace"),
                     "duration_ms": int((time.time() - start_time) * 1000),
                 }
 
-        except asyncio.TimeoutError:
-            proc.kill()
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
             return {
                 "exit_code": -1,
                 "stdout": "",
