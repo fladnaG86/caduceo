@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=manutenzione
 Group=manutenzione
-WorkingDirectory=/home/manutenzione/caduceo
-ExecStart=/home/manutenzione/caduceo/venv/bin/python -m caduceo_relay --config /home/manutenzione/.caduceo/relay.json
+WorkingDirectory=/home/caduceo/caduceo
+ExecStart=/home/caduceo/caduceo/venv/bin/python -m caduceo_relay --config /home/caduceo/.caduceo/relay.json
 Restart=on-failure
 RestartSec=5
 StartLimitBurst=5
@@ -18,7 +18,7 @@ StartLimitBurst=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/manutenzione/.caduceo /tmp
+ReadWritePaths=/home/caduceo/.caduceo /tmp
 PrivateTmp=true
 
 # Logging

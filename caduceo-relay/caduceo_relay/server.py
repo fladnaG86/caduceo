@@ -537,7 +537,7 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
     # ── Public Download Endpoint ────────────────────────────────────────────
 
     INSTALLER_DIR = Path("/mnt/nas_hermes/Cartella Agent Hermes")
-    # DEPLOY_DIR: usa la dir di produzione se presente (dbcoemi /opt/caduceo/deploy),
+    # DEPLOY_DIR: usa la dir di produzione se presente (/opt/caduceo/deploy),
     # altrimenti il default locale. Rende gli endpoint /download funzionanti su entrambi.
     DEPLOY_DIR = Path("/opt/caduceo/deploy") if Path("/opt/caduceo/deploy").exists() \
         else Path("/home/manutenzione/caduceo/deploy")

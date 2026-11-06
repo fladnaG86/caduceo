@@ -287,7 +287,7 @@ class TestSecurity:
 
         try:
             # Configura directory ammesse
-            client_module.ALLOWED_PATHS = ["/home/manutenzione", "/tmp"]
+            client_module.ALLOWED_PATHS = ["/home/caduceo", "/tmp"]
 
             # Path traversal attempt
             with pytest.raises(PermissionError):
@@ -297,8 +297,8 @@ class TestSecurity:
                 validate_path("/etc/shadow")
 
             # Path consentite
-            normal_path = validate_path("/home/manutenzione/documenti/report.txt")
-            assert str(normal_path).startswith("/home/manutenzione")
+            normal_path = validate_path("/home/caduceo/documenti/report.txt")
+            assert str(normal_path).startswith("/home/caduceo")
 
         finally:
             client_module.ALLOWED_PATHS = original_paths

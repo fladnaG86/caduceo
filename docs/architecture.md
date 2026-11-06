@@ -66,7 +66,7 @@ Client ── HTTPS ──→ Cloudflare ──→ Tunnel ──→│ localhost
 | `cloudflared-caduceo.service` | `cloudflared tunnel run --token <TOKEN>` | Tunnel verso Cloudflare |
 | `caddy.service` | Caddy reverse proxy | Dev locale, porta 8400 |
 
-File di deploy in `/home/manutenzione/caduceo/deploy/`:
+File di deploy in `/home/caduceo/caduceo/deploy/`:
 - `caduceo-relay.service`
 - `cloudflared-caduceo.service`
 - `Caddyfile`
