@@ -6,5 +6,9 @@
 # Questo Caddyfile serve solo per sviluppo locale sulla porta 8400.
 
 :8400 {
+	handle_path /download/* {
+		root * /opt/caduceo/deploy
+		file_server
+	}
 	reverse_proxy localhost:8443
 }

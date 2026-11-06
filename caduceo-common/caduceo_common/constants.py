@@ -57,6 +57,15 @@ WS_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
 SCREENSHOT_FORMAT = "png"
 SCREENSHOT_QUALITY = 85  # per JPEG, se usato
 
+# Streaming remoto (remote control)
+STREAM_FORMAT = "jpeg"
+STREAM_QUALITY = 70           # qualità JPEG frame streaming (bilanciamento qualità/bandwidth)
+STREAM_FPS = 10               # frame per secondo target
+STREAM_INTERVAL = 1.0 / STREAM_FPS
+STREAM_MAX_FRAME_BYTES = 512 * 1024  # 512 KB max per singolo frame streaming
+STREAM_SCALE_FACTOR = 1.0     # riduzione scala (1.0 = originale, 0.5 = metà) per risparmiare bandwidth
+STREAM_IDLE_FRAMES = 60       # max frame consecutivi senza cambiamenti prima di auto-stop (risparmio CPU)
+
 # Sistema - nomi piattaforma
 OS_WINDOWS = "windows"
 OS_LINUX = "linux"
@@ -72,6 +81,9 @@ class MessageType:
     FILE_RESPONSE = "file_response"
     SCREENSHOT_RESPONSE = "screenshot_response"
     INFO_RESPONSE = "info_response"
+    STREAM_FRAME = "stream_frame"        # frame JPEG continuo (streaming remoto)
+    INPUT_RESPONSE = "input_response"    # ack dall'agent per evento input
+    STREAM_RESPONSE = "stream_response"  # ack avvio/stop streaming
     ERROR = "error"
 
     # Relay → Agent
@@ -82,6 +94,9 @@ class MessageType:
     FILE_UPLOAD = "file_upload"
     SCREENSHOT = "screenshot"
     INFO = "info"
+    STREAM_START = "stream_start"      # avvia streaming remoto
+    STREAM_STOP = "stream_stop"        # ferma streaming remoto
+    INPUT_EVENT = "input_event"        # evento input (mouse/tastiera) dall'operatore
     PING = "ping"
 
     # Hermes → Relay (REST)

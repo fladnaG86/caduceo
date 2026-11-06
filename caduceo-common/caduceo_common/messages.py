@@ -167,6 +167,66 @@ class PingMessage(Message):
     type: str = MessageType.PING
 
 
+@dataclass
+class StreamStartMessage(Message):
+    """Avvia lo streaming remoto sull'agent."""
+    type: str = MessageType.STREAM_START
+    fps: int = 0              # 0 = usa default STREAM_FPS
+    quality: int = 0          # 0 = usa default STREAM_QUALITY
+    scale_factor: float = 0.0  # 0.0 = usa default STREAM_SCALE_FACTOR
+
+
+@dataclass
+class StreamStopMessage(Message):
+    """Ferma lo streaming remoto sull'agent."""
+    type: str = MessageType.STREAM_STOP
+
+
+@dataclass
+class StreamFrameMessage(Message):
+    """Frame JPEG continuo dall'agent verso il relay (streaming)."""
+    type: str = MessageType.STREAM_FRAME
+    agent_id: str = ""
+    content_b64: str = ""
+    width: int = 0
+    height: int = 0
+    format: str = "jpeg"
+    frame_index: int = 0
+    timestamp: int = 0
+
+
+@dataclass
+class StreamResponse(Message):
+    """Ack dall'agent per avvio/stop streaming."""
+    type: str = MessageType.STREAM_RESPONSE
+    agent_id: str = ""
+    streaming: bool = False
+    error: str = ""
+
+
+@dataclass
+class InputEventMessage(Message):
+    """Evento input (mouse/tastiera) dall'operatore verso l'agent."""
+    type: str = MessageType.INPUT_EVENT
+    event_type: str = ""   # move, down, up, scroll, key_down, key_up, text
+    x: float = 0.0
+    y: float = 0.0
+    button: str = ""       # left, right, middle
+    scroll_delta: float = 0.0
+    key: str = ""          # nome tasto (es. "enter", "a", "ctrl")
+    text: str = ""         # testo da digitare (event_type="text")
+    duration: float = 0.0  # per move: durata transizione (default 0 = istantaneo)
+
+
+@dataclass
+class InputResponse(Message):
+    """Ack dall'agent per evento input."""
+    type: str = MessageType.INPUT_RESPONSE
+    agent_id: str = ""
+    success: bool = False
+    error: str = ""
+
+
 # Mappa tipo messaggio → classe
 MESSAGE_TYPES: dict[str, type] = {
     MessageType.REGISTER: RegisterMessage,
@@ -183,6 +243,12 @@ MESSAGE_TYPES: dict[str, type] = {
     MessageType.SCREENSHOT_RESPONSE: ScreenshotResponse,
     MessageType.INFO: InfoRequestMessage,
     MessageType.INFO_RESPONSE: InfoResponse,
+    MessageType.STREAM_START: StreamStartMessage,
+    MessageType.STREAM_STOP: StreamStopMessage,
+    MessageType.STREAM_FRAME: StreamFrameMessage,
+    MessageType.STREAM_RESPONSE: StreamResponse,
+    MessageType.INPUT_EVENT: InputEventMessage,
+    MessageType.INPUT_RESPONSE: InputResponse,
     MessageType.ERROR: Message,
 }
 

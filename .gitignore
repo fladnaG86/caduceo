@@ -50,3 +50,12 @@ htmlcov/
 
 # NAS staging
 *.bak
+
+# Isolated git worktrees
+.worktrees/
+
+
+# Caduceo LOCAL package artifacts (regenerated / redistributable binaries)
+deploy/caduceo-local/deps/
+deploy/caduceo-local/nssm.exe
+deploy/caduceo-local/*.zip

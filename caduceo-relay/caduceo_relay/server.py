@@ -12,6 +12,8 @@ import stat
 import time
 from pathlib import Path
 from urllib.parse import quote
+import urllib.request
+import urllib.error
 
 import jwt
 import aiosqlite
@@ -416,6 +418,44 @@ class AuditLog:
             self._db = None
 
 
+# ── Impostazioni persistenti (server-side) ────────────────────────────────
+
+class SettingsStore:
+    """Persiste le impostazioni dell'Assistente IA sul server (file JSON),
+    così NON dipendono dalla cache del browser. La chiave API resta sul
+    server e non viene mai esposta al client."""
+    def __init__(self, path: Path):
+        self.path = path
+        self._data: dict = {}
+
+    def load(self) -> dict:
+        try:
+            if self.path.exists():
+                self._data = json.loads(self.path.read_text())
+        except Exception:
+            self._data = {}
+        return self._data
+
+    def get(self, key: str, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key: str, value):
+        self._data[key] = value
+        self._persist()
+
+    def save(self, data: dict):
+        self._data = dict(data)
+        self._persist()
+
+    def _persist(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self._data, indent=2))
+        try:
+            os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+        except Exception:
+            pass
+
+
 # ── App FastAPI ─────────────────────────────────────────────────────────────
 
 def create_app(config: RelayConfig | None = None) -> FastAPI:
@@ -443,6 +483,8 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
     queue = CommandQueue(config.db_path, config.queue_ttl)
     audit = AuditLog(config.db_path.parent / "audit.db")
     crypto = config.crypto
+    settings = SettingsStore(config.db_path.parent / "ai_settings.json")
+    settings.load()
 
     # ── OIDC (Authentik) ─────────────────────────────────────────────────────
     # OIDC è disattivato se issuer o client_id sono vuoti/placeholder. In
@@ -1344,6 +1386,71 @@ def create_app(config: RelayConfig | None = None) -> FastAPI:
         except Exception as exc:
             logger.exception("Login OIDC fallito")
             return oidc_error_redirect(redirect_after, f"authentication_failed: {exc}")
+
+    # ── Assistente IA: impostazioni persistenti (server-side) ────────────
+    # La chiave API resta sul server, non nella cache del browser. Il client
+    # non riceve mai la chiave: invia richieste LLM al relay che le inoltra.
+
+    @app.get("/api/ai/settings")
+    async def ai_get_settings(user: dict = Depends(verify_role("admin"))):
+        """Ritorna le impostazioni dell'Assistente IA (senza chiave API)."""
+        return {
+            "endpoint": "https://openrouter.ai/api/v1",
+            "model": settings.get("model", "openai/gpt-5.6-luna"),
+            "api_key_configured": bool(settings.get("api_key")),
+        }
+
+    @app.post("/api/ai/settings")
+    async def ai_set_settings(payload: dict, user: dict = Depends(verify_role("admin"))):
+        """Salva modello e (opzionalmente) API key sul server."""
+        if "model" in payload:
+            settings.set("model", payload["model"])
+        if "api_key" in payload and isinstance(payload["api_key"], str) and payload["api_key"].strip():
+            key = payload["api_key"].strip()
+            # Ignora chiavi placeholder o non-ASCII (protezione contro errori client)
+            if "••••" in key or not key.isascii() or len(key) < 10:
+                return {"status": "ok", "api_key_configured": bool(settings.get("api_key"))}
+            settings.set("api_key", key)
+        return {"status": "ok", "api_key_configured": bool(settings.get("api_key"))}
+
+    @app.post("/api/ai/chat")
+    async def ai_chat(payload: dict, user: dict = Depends(verify_role("admin"))):
+        """Proxy LLM: il relay chiama OpenRouter con la chiave salvata sul
+        server (mai nel browser). Il client invia solo messages + tools."""
+        api_key = settings.get("api_key")
+        if not api_key:
+            raise HTTPException(400, "API Key OpenRouter non configurata.")
+        model = payload.get("model") or settings.get("model", "openai/gpt-5.6-luna")
+
+        body = {
+            "model": model,
+            "messages": payload.get("messages", []),
+            "temperature": payload.get("temperature", 0.2),
+            "tools": payload.get("tools"),
+        }
+        # Rimuovi chiavi None per evitare errori
+        body = {k: v for k, v in body.items() if v is not None}
+
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": "Bearer " + api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:500]
+            logger.error(f"OpenRouter HTTP {e.code}: {detail}")
+            raise HTTPException(502, f"OpenRouter error {e.code}: {detail}")
+        except Exception as e:
+            logger.error(f"OpenRouter request failed: {e}", exc_info=True)
+            raise HTTPException(502, f"OpenRouter request failed: {e}")
+        return data
 
     @app.get("/api/health")
     async def health():

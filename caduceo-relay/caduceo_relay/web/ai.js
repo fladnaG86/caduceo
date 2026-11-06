@@ -29,6 +29,23 @@
   const MAX_ITER      = 10;
   const FETCH_TIMEOUT = 60000; // ms
 
+  // Endpoint OpenRouter predefinito (fisso).
+  const DEFAULT_ENDPOINT = 'https://openrouter.ai/api/v1';
+
+  // Modelli proposti (tutti compatibili con il tool calling di Caduceo).
+  const MODELS = [
+    { id: 'openai/gpt-5.6-luna',            label: 'GPT-5.6 Luna (OpenAI)' },
+    { id: 'openai/gpt-5.6-terra',           label: 'GPT-5.6 Terra (OpenAI)' },
+    { id: 'anthropic/claude-sonnet-5',      label: 'Claude Sonnet 5 (Anthropic)' },
+    { id: 'google/gemini-3.7-flash',        label: 'Gemini 3.7 Flash (Google)' },
+    { id: 'google/gemini-3.5-flash-lite',   label: 'Gemini 3.5 Flash Lite (Google)' },
+    { id: 'deepseek/deepseek-v4-pro-0813',  label: 'DeepSeek V4 Pro' },
+    { id: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
+    { id: 'qwen/qwen3.8-max',               label: 'Qwen 3.8 Max (Alibaba)' },
+    { id: 'moonshotai/kimi-k3',             label: 'Kimi K3 (Moonshot)' },
+    { id: 'z-ai/glm-5.2',                   label: 'GLM 5.2 (Z.AI)' },
+  ];
+
   /* ────────────────────────────────────────────────────────────────────────
    * Stato del modulo (condiviso tra init e render)
    * ──────────────────────────────────────────────────────────────────────── */
@@ -39,6 +56,8 @@
     running:       false,       // ciclo in esecuzione
     abortFlag:     false,       // segnale di interruzione
     configVisible: true,        // pannello configurazione aperto/chiuso
+    commandLog:    [],          // registro comandi eseguiti
+    logVisible:    false,       // finestra comandi visibile
   };
 
   /* ────────────────────────────────────────────────────────────────────────
@@ -101,7 +120,19 @@
   outline: none;
   transition: border-color .15s;
 }
-.cai-field input:focus { border-color: var(--accent); }
+.cai-field select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: .85rem;
+  outline: none;
+  cursor: pointer;
+  transition: border-color .15s;
+  max-height: 140px;
+}
+.cai-field input:focus, .cai-field select:focus { border-color: var(--accent); }
 .cai-save-btn {
   grid-column: 1 / -1;
   justify-self: end;
@@ -222,6 +253,58 @@
   border: 1px solid var(--danger);
   color: var(--danger);
 }
+
+/* ── Layout messaggi stile Hermes (avatar + bolla) ── */
+.cai-row {
+  display: flex;
+  gap: 10px;
+  max-width: 100%;
+}
+.cai-row.user { flex-direction: row-reverse; }
+.cai-avatar {
+  width: 30px; height: 30px;
+  border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; flex-shrink: 0;
+}
+.cai-avatar.user { background: var(--accent); }
+.cai-avatar.bot  { background: var(--card-2, #24344d); border: 1px solid var(--border); }
+.cai-row .cai-bubble { max-width: 100%; }
+.cai-row.user .cai-bubble { background: var(--accent); }
+.cai-row.assistant .cai-bubble { background: transparent; border: none; padding: 4px 0; }
+
+/* ── Finestra comandi eseguiti (nascondibile) ── */
+.cai-log-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.cai-log-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px; cursor: pointer; user-select: none;
+}
+.cai-log-header:hover { background: rgba(255,255,255,.04); }
+.cai-log-title { font-weight: 600; font-size: .85rem; display: flex; align-items: center; gap: 8px; }
+.cai-log-toggle { font-size: .8rem; color: var(--muted); }
+.cai-log-body {
+  max-height: 240px; overflow-y: auto;
+  border-top: 1px solid var(--border);
+  padding: 4px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .78rem;
+}
+.cai-log-body.hidden { display: none; }
+.cai-log-line {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 5px 14px; white-space: pre-wrap; word-break: break-all;
+}
+.cai-log-line .t { color: var(--muted); flex-shrink: 0; }
+.cai-log-line .a { color: var(--accent); flex-shrink: 0; font-weight: 600; }
+.cai-log-line .c { color: var(--text); }
+.cai-log-line.ok { color: var(--success); }
+.cai-log-line.err { color: var(--danger); }
+.cai-log-empty { color: var(--muted); padding: 10px 14px; font-style: italic; }
 /* Step agentico */
 .cai-step {
   align-self: flex-start;
@@ -417,33 +500,39 @@
 
     const configBody = el('div', 'cai-config-body');
 
-    // Campo Endpoint
+    // Endpoint: fisso su OpenRouter (nascosto, sempre DEFAULT_ENDPOINT)
     const fEndpoint = el('div', 'cai-field full');
-    const lEndpoint = el('label', '', 'Endpoint URL');
+    const lEndpoint = el('label', '', 'Endpoint URL (OpenRouter)');
     const iEndpoint = el('input');
     iEndpoint.type = 'text';
-    iEndpoint.placeholder = 'https://api.openai.com/v1  oppure  http://192.168.x.x:11434/v1';
+    iEndpoint.value = DEFAULT_ENDPOINT;
+    iEndpoint.readOnly = true;
+    iEndpoint.style.cursor = 'not-allowed';
+    iEndpoint.style.opacity = '0.7';
     iEndpoint.id = 'cai-endpoint';
     fEndpoint.appendChild(lEndpoint);
     fEndpoint.appendChild(iEndpoint);
 
     // Campo API Key
     const fKey = el('div', 'cai-field');
-    const lKey = el('label', '', 'API Key');
+    const lKey = el('label', '', 'OpenRouter API Key');
     const iKey = el('input');
     iKey.type = 'password';
-    iKey.placeholder = 'sk-… (lascia vuoto se non richiesta)';
+    iKey.placeholder = 'sk-or-v1-… (richiesta per OpenRouter)';
     iKey.id = 'cai-apikey';
     fKey.appendChild(lKey);
     fKey.appendChild(iKey);
 
-    // Campo Modello
+    // Select Modello (scrollabile)
     const fModel = el('div', 'cai-field');
     const lModel = el('label', '', 'Modello');
-    const iModel = el('input');
-    iModel.type = 'text';
-    iModel.placeholder = 'gpt-4o-mini, llama3.2, mistral, …';
+    const iModel = el('select');
     iModel.id = 'cai-model';
+    MODELS.forEach(function (m) {
+      const opt = el('option', '', m.label);
+      opt.value = m.id;
+      iModel.appendChild(opt);
+    });
     fModel.appendChild(lModel);
     fModel.appendChild(iModel);
 
@@ -473,6 +562,32 @@
     agentsPanel.appendChild(agentsHeader);
     agentsPanel.appendChild(agentsList);
     root.appendChild(agentsPanel);
+
+    // ── Pannello comandi eseguiti (finestra nascosta) ────────────────────
+    const logPanel  = el('div', 'cai-log-panel');
+    const logHeader = el('div', 'cai-log-header');
+    const logTitle  = el('div', 'cai-log-title', '⚙️ Comandi eseguiti');
+    const logToggle = el('span', 'cai-log-toggle', '▼ mostra');
+    logHeader.appendChild(logTitle);
+    logHeader.appendChild(logToggle);
+    const logBody = el('div', 'cai-log-body hidden');
+    const logEmpty = el('div', 'cai-log-empty', 'Nessun comando eseguito in questa sessione.');
+    logBody.appendChild(logEmpty);
+    logPanel.appendChild(logHeader);
+    logPanel.appendChild(logBody);
+    root.appendChild(logPanel);
+
+    // Evento: toggle visibilità finestra comandi
+    logHeader.addEventListener('click', () => {
+      _state.logVisible = !_state.logVisible;
+      if (_state.logVisible) {
+        logBody.classList.remove('hidden');
+        logToggle.textContent = '▲ nascondi';
+      } else {
+        logBody.classList.add('hidden');
+        logToggle.textContent = '▼ mostra';
+      }
+    });
 
     // ── Pannello chat ────────────────────────────────────────────────────
     const chatPanel   = el('div', 'cai-chat-panel');
@@ -517,15 +632,22 @@
       }
     });
 
-    // ── Evento: salva configurazione ─────────────────────────────────────
-    saveBtn.addEventListener('click', () => {
-      const cfg = {
-        endpoint: iEndpoint.value.trim().replace(/\/$/, ''),
-        api_key:  iKey.value.trim(),
-        model:    iModel.value.trim(),
-      };
-      saveConfig(cfg);
-      window.App.toast('Configurazione salvata', 'success');
+    // ── Evento: salva configurazione (su server, non nella cache) ───────
+    saveBtn.addEventListener('click', async () => {
+      const model = iModel.value;
+      const key = iKey.value.trim();
+      const payload = { model: model };
+      // Invia la chiave SOLO se non è il placeholder "chiave salvata sul
+      // server". Se il campo mostra i puntini, significa che la chiave è già
+      // sul server e va mantenuta (non sovrascritta).
+      const isPlaceholder = key.indexOf('••••••••') !== -1;
+      if (key && !isPlaceholder) payload.api_key = key;
+      try {
+        await window.App.api('/api/ai/settings', { method: 'POST', body: payload });
+        window.App.toast('Configurazione salvata sul server', 'success');
+      } catch (err) {
+        window.App.toast('Errore nel salvataggio: ' + (err.message || err), 'error');
+      }
     });
 
     // ── Evento: seleziona tutti agenti ───────────────────────────────────
@@ -580,10 +702,23 @@
     textarea.addEventListener('input', () => autoResizeTextarea(textarea));
 
     // ── Popolamento iniziale ─────────────────────────────────────────────
-    const cfg = loadConfig();
-    iEndpoint.value = cfg.endpoint || '';
-    iKey.value      = cfg.api_key  || '';
-    iModel.value    = cfg.model    || '';
+    iEndpoint.value = DEFAULT_ENDPOINT;
+    // Carica le impostazioni dal server (persistenti, non cache)
+    async function loadSettingsFromServer() {
+      try {
+        const s = await window.App.api('/api/ai/settings');
+        if (s && s.model && MODELS.some(m => m.id === s.model)) {
+          iModel.value = s.model;
+        }
+        if (s && s.api_key_configured) {
+          iKey.value = '•••••••• (chiave salvata sul server)';
+          iKey.placeholder = 'Lasciare vuoto per mantenere la chiave salvata';
+        }
+      } catch (err) {
+        // ignora: se il server non risponde, restano i default
+      }
+    }
+    loadSettingsFromServer();
 
     appendWelcome(chatMessages);
     loadAgents(agentsList);
@@ -677,27 +812,39 @@
   }
 
   function appendWelcome(chatMessages) {
+    const row = el('div', 'cai-row assistant');
+    const av = el('div', 'cai-avatar bot', '🤖');
     const bubble = el('div', 'cai-bubble assistant');
     bubble.textContent =
       'Ciao! Sono l\'Assistente IA Agentico di Caduceo.\n\n' +
       'Descrivi in linguaggio naturale cosa vuoi fare sui PC remoti ' +
       '(es. "controlla lo spazio disco su pc1", "esegui whoami su tutti gli agenti selezionati").\n\n' +
       'Configura l\'endpoint LLM in alto, seleziona gli agenti e inizia a scrivere.';
-    chatMessages.appendChild(bubble);
+    row.appendChild(av);
+    row.appendChild(bubble);
+    chatMessages.appendChild(row);
   }
 
   function appendUserBubble(chatMessages, text) {
+    const row = el('div', 'cai-row user');
+    const av = el('div', 'cai-avatar user', '🧑');
     const bubble = el('div', 'cai-bubble user');
     bubble.textContent = text;
-    chatMessages.appendChild(bubble);
+    row.appendChild(av);
+    row.appendChild(bubble);
+    chatMessages.appendChild(row);
     scrollBottom(chatMessages);
     return bubble;
   }
 
   function appendAssistantBubble(chatMessages, text) {
+    const row = el('div', 'cai-row assistant');
+    const av = el('div', 'cai-avatar bot', '🤖');
     const bubble = el('div', 'cai-bubble assistant');
     bubble.textContent = text;
-    chatMessages.appendChild(bubble);
+    row.appendChild(av);
+    row.appendChild(bubble);
+    chatMessages.appendChild(row);
     scrollBottom(chatMessages);
     return bubble;
   }
@@ -724,10 +871,60 @@
   }
 
   /**
+   * Registra un comando nel registro eseguiti (finestra nascosta).
+   * @param {string} agentInfo
+   * @param {string} command
+   * @param {Object} [result]
+   */
+  function addCommandLog(agentInfo, command, result) {
+    const ok = result && result.exit_code === 0;
+    const queued = result && result.status === 'queued';
+    const ts = new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    _state.commandLog.push({
+      ts: ts,
+      agent: agentInfo,
+      command: command,
+      ok: ok,
+      queued: queued,
+      exit: result && result.exit_code !== undefined ? result.exit_code : null,
+    });
+
+    // Aggiorna il pannello log se presente nel DOM
+    const logBody = document.querySelector('.cai-log-body');
+    if (!logBody) return;
+    const empty = logBody.querySelector('.cai-log-empty');
+    if (empty) empty.remove();
+
+    const line = el('div', 'cai-log-line ' + (ok ? 'ok' : (queued ? '' : 'err')));
+    const t = el('span', 't', ts);
+    const a = el('span', 'a', (agentInfo || '').slice(0, 14));
+    const c = el('span', 'c', command);
+    line.appendChild(t);
+    line.appendChild(a);
+    line.appendChild(c);
+    if (result && result.exit_code !== undefined) {
+      const e = el('span', (ok ? 'ok' : 'err'), ok ? '✓' : ('exit ' + result.exit_code));
+      line.appendChild(e);
+    } else if (queued) {
+      const e = el('span', 't', '⏳ coda');
+      line.appendChild(e);
+    }
+    logBody.appendChild(line);
+    logBody.scrollTop = logBody.scrollHeight;
+  }
+
+  /**
    * Aggiunge un blocco "step agentico" con intestazione e sezioni stdout/stderr.
    * Usa solo textContent per sicurezza XSS.
    */
   function appendStepBlock(chatMessages, agentInfo, command, result) {
+    // Il registro comandi è non-bloccante: un errore qui non deve mai
+    // impedire di mostrare la risposta finale dell'assistente.
+    try {
+      addCommandLog(agentInfo, command, result);
+    } catch (err) {
+      console.error('[CaduceoAI] Errore registro comandi:', err);
+    }
     const step = el('div', 'cai-step');
 
     const header = el('div', 'cai-step-header');
@@ -861,18 +1058,21 @@ Linee guida operative:
    * Ciclo agentico principale
    * ──────────────────────────────────────────────────────────────────────── */
 
+  /** Legge il modello selezionato nello stato attuale della UI. */
+  function readLiveModel() {
+    const modelEl = document.getElementById('cai-model');
+    if (modelEl && modelEl.value) return modelEl.value;
+    const saved = loadConfig();
+    return saved.model || '';
+  }
+
   async function runAgenticLoop(userText, chatMessages, stopBtn, textarea, sendBtn) {
-    const cfg = loadConfig();
+    const model = readLiveModel();
 
     // Validazione configurazione
-    if (!cfg.endpoint) {
+    if (!model) {
       appendErrorBubble(chatMessages,
-        'Endpoint LLM non configurato. Apri il pannello "Configurazione LLM" e inserisci l\'URL.');
-      return;
-    }
-    if (!cfg.model) {
-      appendErrorBubble(chatMessages,
-        'Modello non configurato. Inserisci il nome del modello (es. gpt-4o-mini) nella configurazione.');
+        'Modello non configurato. Apri il pannello "Configurazione LLM" e seleziona un modello dalla lista.');
       return;
     }
 
@@ -917,68 +1117,44 @@ Linee guida operative:
         // Costruisce la lista messaggi completa: system + storia
         const msgs = [systemMsg, ..._state.messages];
 
-        // Headers
-        const headers = { 'Content-Type': 'application/json' };
-        if (cfg.api_key) {
-          headers['Authorization'] = 'Bearer ' + cfg.api_key;
-        }
-
-        // Chiamata al LLM
-        let response;
-        try {
-          response = await fetchWithTimeout(
-            cfg.endpoint + '/chat/completions',
-            {
-              method: 'POST',
-              headers,
-              body: JSON.stringify({
-                model:       cfg.model,
-                messages:    msgs,
-                temperature: 0.2,
-                tools:       TOOLS,
-              }),
-            },
-            FETCH_TIMEOUT
-          );
-        } catch (fetchErr) {
-          if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
-          if (fetchErr.name === 'AbortError') {
-            appendErrorBubble(chatMessages, 'Timeout: il server LLM non ha risposto entro ' + (FETCH_TIMEOUT / 1000) + ' secondi.');
-          } else {
-            appendErrorBubble(chatMessages, 'Errore di rete nella chiamata al LLM: ' + fetchErr.message);
-          }
-          break;
-        }
-
-        if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
-
-        if (!response.ok) {
-          let detail = 'Errore HTTP ' + response.status;
-          try {
-            const errBody = await response.json();
-            if (errBody && errBody.error && errBody.error.message) {
-              detail += ': ' + errBody.error.message;
-            }
-          } catch (_) { /* ignora */ }
-          appendErrorBubble(chatMessages, detail);
-          break;
-        }
-
+        // Chiamata al proxy LLM sul relay (la chiave è sul server)
         let data;
         try {
-          data = await response.json();
-        } catch (_) {
-          appendErrorBubble(chatMessages, 'Risposta del server LLM non valida (JSON non parsabile).');
+          data = await window.App.api('/api/ai/chat', {
+            method: 'POST',
+            body: {
+              model: model,
+              messages: msgs,
+              temperature: 0.2,
+              tools: TOOLS,
+            },
+          });
+        } catch (chatErr) {
+          if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+          appendErrorBubble(chatMessages, 'Errore nella chiamata LLM: ' + (chatErr.message || chatErr));
           break;
         }
 
         const choice = data && data.choices && data.choices[0];
         if (!choice || !choice.message) {
+          if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
           appendErrorBubble(chatMessages, 'Risposta LLM vuota o malformata.');
           break;
         }
 
-        const assistantMsg = choice.message;
+        // Rimuovi l'indicatore di pensiero appena arriva la risposta
+        if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+
+        // Normalizza il messaggio assistant: content null -> stringa vuota,
+        // così la seconda richiesta non reinvia content:null che alcuni
+        // adapter OpenRouter rifiutano.
+        const assistantMsg = {
+          role: 'assistant',
+          content: choice.message.content ?? '',
+          ...(choice.message.tool_calls && choice.message.tool_calls.length
+            ? { tool_calls: choice.message.tool_calls }
+            : {}),
+        };
 
         // Aggiungi il messaggio dell'assistente alla storia
         _state.messages.push(assistantMsg);
@@ -1120,6 +1296,8 @@ Linee guida operative:
         running:       false,
         abortFlag:     false,
         configVisible: true,
+        commandLog:    [],
+        logVisible:    false,
       };
       buildUI(container);
     },

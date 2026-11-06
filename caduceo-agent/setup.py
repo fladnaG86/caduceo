@@ -13,6 +13,8 @@ setup(
     extras_require={
         "windows": ["pywin32>=306", "pyautogui>=0.9"],
         "screenshot": ["pyautogui>=0.9"],
+        "stream": ["mss>=9.0", "pyautogui>=0.9"],
+        "remote": ["pyautogui>=0.9", "mss>=9.0"],
     },
     entry_points={
         "console_scripts": [

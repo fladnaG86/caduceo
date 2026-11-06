@@ -1,11 +1,16 @@
 <#
 .SYNOPSIS
-Caduceo Agent Installer for Windows
+Caduceo Agent Installer for Windows (Self-Contained)
 Works WITH or WITHOUT Python. Handles Windows Store stub automatically.
+Installs from local .whl files — no downloads from zrok.io.
 
 .PARAMETER AgentId
 Unique identifier for this agent (e.g. "mio-pc", "ufficio", "laptop")
 If not specified, uses COMPUTERNAME in lowercase.
+
+.PARAMETER RelayUrl
+WebSocket relay URL (e.g. "wss://your-relay.example.com").
+If not specified, a default is used.
 
 .PARAMETER Tags
 Comma-separated tags (default: "caduceo")
@@ -15,16 +20,14 @@ PSK per autenticazione (opzionale, se non specificato usa default)
 
 .EXAMPLE
 .\install-agent.ps1 -AgentId my-pc
-.\install-agent.ps1 -AgentId ufficio -Tags "caduceo,office"
-
-One-liner (run from CMD or PowerShell):
-  powershell -Command "& { $f=\"$env:TEMP\install-agent.ps1\"; Invoke-WebRequest 'https://your-relay.example.com/download/install-agent.ps1' -OutFile $f -UseBasicParsing; & $f -AgentId my-pc }"
+.\install-agent.ps1 -AgentId ufficio -Tags "caduceo,office" -RelayUrl "wss://your-relay.example.com"
 #>
 
 param(
-    [string]$AgentId = "",
-    [string]$Tags = "caduceo",
-    [string]$PskHex = ""
+    [string]$AgentId   = "",
+    [string]$RelayUrl  = "",
+    [string]$Tags      = "caduceo",
+    [string]$PskHex    = ""
 )
 
 # Do NOT set $ErrorActionPreference="Stop" globally - it kills on stderr from external commands
@@ -68,7 +71,9 @@ function Invoke-NativeSafe {
 # ============================================================
 #  CONFIGURATION
 # ============================================================
-$RelayUrl  = "wss://your-relay.example.com"
+if ($RelayUrl -eq "") {
+    $RelayUrl = "wss://your-relay.example.com"
+}
 # Use PSK from parameter if provided, otherwise use default (for backwards compatibility)
 if ($PskHex -eq "") {
     $PskHex = "CHANGE_ME_GENERATE_A_NEW_PSK"
@@ -339,32 +344,63 @@ Write-Host "       Relay:    $RelayUrl"
 #  STEP 3: Install caduceo packages
 # ============================================================
 if ($useVenv) {
-    # System Python: download and run install.py (which creates venv)
-    Write-Status "[3/6] Scaricamento install.py..."
-    $installPy = Join-Path $env:TEMP "caduceo-install.py"
-    Add-TempFile -Path $installPy
-    try {
-        Invoke-WebRequest -Uri "https://your-relay.example.com/download/install.py?platform=windows" -OutFile $installPy -UseBasicParsing
-    } catch {
-        $dlExit = Invoke-NativeSafe { curl.exe -sL -o $installPy "https://your-relay.example.com/download/install.py?platform=windows" }
-        # Verify file exists and has content after curl
-        if (-not (Test-Path $installPy) -or (Get-Item $installPy).Length -eq 0) {
-            Write-Err "ERRORE: Impossibile scaricare install.py"
-            exit 1
-        }
+    # System Python: create venv locally and install from .whl files
+    Write-Status "[3/6] Creazione virtual environment e installazione pacchetti..."
+
+    # Locate .whl files next to THIS script ($PSScriptRoot)
+    $scriptDir = $PSScriptRoot
+    if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+
+    $commonWhl = Join-Path $scriptDir "caduceo_common-0.1.0-py3-none-any.whl"
+    $agentWhl  = Join-Path $scriptDir "caduceo_agent-0.1.0-py3-none-any.whl"
+
+    if (-not (Test-Path $commonWhl)) {
+        Write-Err "ERRORE: $commonWhl non trovato."
+        Write-Err "       Assicurati di eseguire lo script dalla cartella del .zip decompresso."
+        exit 1
     }
-    Write-OK "       install.py scaricato"
-
-    Write-Status "[4/6] Installazione (venv)..."
-    $installExit = Invoke-NativeSafe { & $usePython $installPy }
-    if ($installExit -ne 0) {
-        Write-Warn "       install.py completato con codice $installExit (potrebbe essere ok)"
+    if (-not (Test-Path $agentWhl)) {
+        Write-Err "ERRORE: $agentWhl non trovato."
+        Write-Err "       Assicurati di eseguire lo script dalla cartella del .zip decompresso."
+        exit 1
     }
 
-    $venvPython  = Join-Path $CaduceoDir "venv\Scripts\python.exe"
-    $venvPythonw = Join-Path $CaduceoDir "venv\Scripts\pythonw.exe"
+    Write-OK "       Wheel files trovati nella cartella locale"
 
-    # Write config again (install.py may overwrite it)
+    # Create virtual environment
+    $venvDir = Join-Path $CaduceoDir "venv"
+    Write-Status "[4/6] Creazione venv in $venvDir ..."
+    $venvExit = Invoke-NativeSafe { & $usePython -m venv "$venvDir" }
+    if ($venvExit -ne 0) {
+        Write-Err "ERRORE: Creazione venv fallita (exit=$venvExit)."
+        Write-Err "       Prova manualmente: `"$usePython`" -m venv `"$venvDir`""
+        exit 1
+    }
+
+    $venvPython  = Join-Path $venvDir "Scripts\python.exe"
+    $venvPythonw = Join-Path $venvDir "Scripts\pythonw.exe"
+
+    if (-not (Test-Path $venvPython)) {
+        Write-Err "ERRORE: venv python.exe non trovato in $venvDir\Scripts\"
+        exit 1
+    }
+
+    Write-OK "       venv creato"
+
+    # Upgrade pip, then install all packages in one go
+    Write-Host "       Installazione dipendenze e pacchetti..."
+    $pipUpgradeExit = Invoke-NativeSafe { & $venvPython -m pip install --upgrade pip --quiet }
+    $pipExit = Invoke-NativeSafe { & $venvPython -m pip install websockets psutil pywin32 Pillow "$commonWhl" "$agentWhl" --quiet }
+
+    if ($pipExit -ne 0) {
+        Write-Err "ERRORE: Installazione pacchetti fallita."
+        Write-Err "Prova manualmente: `"$venvPython`" -m pip install websockets psutil pywin32 Pillow `"$commonWhl`" `"$agentWhl`""
+        exit 1
+    }
+
+    Write-OK "       Pacchetti installati nel venv"
+
+    # Write config again (venv creation may reset things)
     # Reset permissions first since icacls set it to (R) earlier
     if (Test-Path $configFile) {
         Invoke-NativeSafe { icacls $configFile /grant:r "$($env:USERNAME):(F)" } | Out-Null
@@ -375,59 +411,38 @@ if ($useVenv) {
     Invoke-NativeSafe { icacls $configFile /inheritance:r /grant:r "$($env:USERNAME):(R)" } | Out-Null
 
 } else {
-    # Embedded Python: install packages directly (no venv)
+    # Embedded Python: install packages directly from local .whl files (no venv)
     Write-Status "[3/6] Installazione pacchetti in Python embeddable..."
 
-    # Download install.py and extract wheels
-    Write-Host "       Scaricamento pacchetti caduceo..."
-    $instPy = Join-Path $env:TEMP "caduceo-install.py"
-    Add-TempFile -Path $instPy
-    try {
-        Invoke-WebRequest -Uri "https://your-relay.example.com/download/install.py?platform=windows" -OutFile $instPy -UseBasicParsing
-    } catch {
-        $dlExit = Invoke-NativeSafe { curl.exe -sL -o $instPy "https://your-relay.example.com/download/install.py?platform=windows" }
-        # Verify file exists and has content after curl
-        if (-not (Test-Path $instPy) -or (Get-Item $instPy).Length -eq 0) {
-            Write-Err "ERRORE: Impossibile scaricare i pacchetti caduceo."
-            exit 1
-        }
+    # Locate .whl files next to THIS script ($PSScriptRoot)
+    $scriptDir = $PSScriptRoot
+    if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition }
+
+    $commonWhl = Join-Path $scriptDir "caduceo_common-0.1.0-py3-none-any.whl"
+    $agentWhl  = Join-Path $scriptDir "caduceo_agent-0.1.0-py3-none-any.whl"
+
+    if (-not (Test-Path $commonWhl)) {
+        Write-Err "ERRORE: $commonWhl non trovato."
+        Write-Err "       Assicurati di eseguire lo script dalla cartella del .zip decompresso."
+        exit 1
     }
-
-    $commonWhl = Join-Path $CaduceoDir "caduceo_common-0.1.0-py3-none-any.whl"
-    $agentWhl  = Join-Path $CaduceoDir "caduceo_agent-0.1.0-py3-none-any.whl"
-    Add-TempFile -Path $commonWhl
-    Add-TempFile -Path $agentWhl
-
-    # Extract wheels from install.py using Python itself
-    $extractScriptFile = Join-Path $env:TEMP "extract_wheels.py"
-    Add-TempFile -Path $extractScriptFile
-    
-    # Base64 encoded Python script to avoid PowerShell ParserErrors
-    $b64Script = "aW1wb3J0IGJhc2U2NCwgcmUsIHN5cwpjb250ZW50ID0gb3BlbihyJ3tpbnN0UHl9JykucmVhZCgpCmZvciB2YXIsIGZuYW1lIGluIFsoJ1dIRUVMX0NPTU1PTl9CNjQnLCByJ3tjb21tb25XaGx9JyksICgnV0hFRUxfQUdFTlRfQjY0Jywgcid7YWdlbnRXaGx9JyldOgogICAgbWF0Y2ggPSByZS5zZWFyY2godmFyICsgcicgPSAiKFteIl17MTAwLH0pIicsIGNvbnRlbnQpCiAgICBpZiBtYXRjaDoKICAgICAgICB3aXRoIG9wZW4oZm5hbWUsICd3YicpIGFzIGY6CiAgICAgICAgICAgIGYud3JpdGUoYmFzZTY0LmI2NGRlY29kZShtYXRjaC5ncm91cCgxKSkpCiAgICAgICAgcHJpbnQoJ09LOiAnICsgZm5hbWUpCiAgICBlbHNlOgogICAgICAgIHByaW50KCdTS0lQOiAnICsgdmFyICsgJyBub24gdHJvdmF0bycpCiAgICAgICAgc3lzLmV4aXQoMSk="
-    
-    # Decode and replace placeholders with actual paths
-    $decodedScript = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64Script))
-    $decodedScript = $decodedScript -replace '\{instPy\}', $instPy -replace '\{commonWhl\}', $commonWhl -replace '\{agentWhl\}', $agentWhl
-    
-    Set-ContentNoBom -Path $extractScriptFile -Content $decodedScript
-
-    $extractExit = Invoke-NativeSafe { & $usePython $extractScriptFile }
-    if ($extractExit -ne 0) {
-        Write-Err "ERRORE: Estrazione wheel fallita. Controlla la connessione internet."
+    if (-not (Test-Path $agentWhl)) {
+        Write-Err "ERRORE: $agentWhl non trovato."
+        Write-Err "       Assicurati di eseguire lo script dalla cartella del .zip decompresso."
         exit 1
     }
 
-    # Install all packages in one go (critical: both wheels at once)
+    Write-OK "       Wheel files trovati nella cartella locale"
+
     Write-Host "       Installazione dipendenze e pacchetti..."
     $pipExit = Invoke-NativeSafe { & $usePython -m pip install websockets psutil pywin32 Pillow "$commonWhl" "$agentWhl" --quiet }
 
     if ($pipExit -ne 0) {
         Write-Err "ERRORE: Installazione pacchetti fallita."
-        Write-Err "Prova manualmente: $usePython -m pip install websockets psutil pywin32 Pillow $commonWhl $agentWhl"
+        Write-Err "Prova manualmente: `"$usePython`" -m pip install websockets psutil pywin32 Pillow `"$commonWhl`" `"$agentWhl`""
         exit 1
     }
 
-    # Files will be cleaned up at end of script via Cleanup-TempFiles
     Write-OK "       Pacchetti installati"
 
     $venvPython  = $usePython
